@@ -144,12 +144,15 @@ If `tcpdump` is available or can be installed, the script creates:
 
 ```text
 /etc/systemd/system/eth1-capture.service
+/usr/local/sbin/eth1-capture-start.sh
 /var/log/pcap
 ```
 
-The service attaches `tcpdump` directly to `eth1` as soon as the interface exists.
-This is intentional: it allows capture of the first DHCP, ARP, or other packets
-immediately after link-up.
+The service runs `/usr/local/sbin/eth1-capture-start.sh`, which attaches
+`tcpdump` directly to `eth1` as soon as the interface exists. This is
+intentional: it allows capture of the first DHCP, ARP, or other packets
+immediately after link-up. The helper runs `tcpdump` with `-Z root` so Debian's
+tcpdump privilege dropping does not prevent writing to `/var/log/pcap`.
 
 Capture files use timestamped names:
 

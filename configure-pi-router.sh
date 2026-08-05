@@ -32,6 +32,7 @@ LAN_DHCP_RANGE_DISPLAY="10.0.0.100-10.0.0.250"
 CREDENTIALS_FILE="/root/pi-router-wifi.txt"
 PCAP_DIRECTORY="/var/log/pcap"
 CAPTURE_SERVICE="/etc/systemd/system/eth1-capture.service"
+CAPTURE_HELPER="/usr/local/sbin/eth1-capture-start.sh"
 PCAP_SIZE_MB="200"
 PCAP_FILE_COUNT="10"
 
@@ -537,6 +538,7 @@ configure_capture_service() {
     local bash_path=""
     local tcpdump_path=""
     local timestamp=""
+    local temporary_helper=""
     local temporary_service=""
 
     if [[ "$ENABLE_CAPTURE" == "no" ]]; then
@@ -556,8 +558,19 @@ configure_capture_service() {
 
     bash_path="$(command -v bash)"
     tcpdump_path="$(command -v tcpdump)"
+    mkdir -p "/usr/local/sbin"
     mkdir -p "$PCAP_DIRECTORY"
     chmod 700 "$PCAP_DIRECTORY"
+
+    temporary_helper="${CAPTURE_HELPER}.$$"
+    {
+        printf '#!%s\n' "$bash_path"
+        printf 'set -Eeuo pipefail\n'
+        printf '\n'
+        printf 'exec %q -i %q -nn -s 0 -U -C %q -W %q -Z root -w %q/eth1-$(date +%%Y%%m%%d-%%H%%M%%S).pcap\n' "$tcpdump_path" "$LAN_IF" "$PCAP_SIZE_MB" "$PCAP_FILE_COUNT" "$PCAP_DIRECTORY"
+    } | tee "$temporary_helper" >/dev/null
+    chmod 755 "$temporary_helper"
+    mv "$temporary_helper" "$CAPTURE_HELPER"
 
     if [[ -f "$CAPTURE_SERVICE" ]]; then
         timestamp="$(date '+%Y%m%d-%H%M%S')"
@@ -576,7 +589,7 @@ configure_capture_service() {
         printf 'ConditionPathExists=/sys/class/net/%s\n' "$LAN_IF"
         printf '\n[Service]\n'
         printf 'Type=simple\n'
-        printf 'ExecStart=%s -c '\''exec "$0" -i "$1" -nn -s 0 -U -C "$2" -W "$3" -w "$4/eth1-$(date +%%%%Y%%%%m%%%%d-%%%%H%%%%M%%%%S).pcap"'\'' %s %s %s %s %s\n' "$bash_path" "$tcpdump_path" "$LAN_IF" "$PCAP_SIZE_MB" "$PCAP_FILE_COUNT" "$PCAP_DIRECTORY"
+        printf 'ExecStart=%s\n' "$CAPTURE_HELPER"
         printf 'Restart=on-failure\n'
         printf 'RestartSec=5\n'
         printf '\n[Install]\n'
