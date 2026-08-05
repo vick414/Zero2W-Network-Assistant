@@ -161,6 +161,11 @@ set_managed_interface() {
     nmcli device set "$interface_name" managed yes
 }
 
+bring_interface_up() {
+    local interface_name="$1"
+    ip link set "$interface_name" up >/dev/null 2>&1 || warn "Could not force $interface_name administratively up; NetworkManager will still try to activate it."
+}
+
 normalize_enable_capture() {
     case "$ENABLE_CAPTURE" in
         yes|YES|true|TRUE|1) ENABLE_CAPTURE="yes" ;;
@@ -262,7 +267,7 @@ load_or_create_credentials() {
 
 connection_exists() {
     local profile_name="$1"
-    nmcli -g connection.id connection show "$profile_name" >/dev/null 2>&1
+    nmcli connection show "$profile_name" >/dev/null 2>&1
 }
 
 disable_competing_profiles() {
@@ -273,6 +278,7 @@ disable_competing_profiles() {
     local bound_if=""
     local connection_type=""
     local active_connection=""
+    local should_disable=""
 
     active_connection="$(nmcli -g GENERAL.CONNECTION device show "$interface_name" 2>/dev/null | head -n 1 || true)"
 
@@ -286,14 +292,23 @@ disable_competing_profiles() {
             continue
         fi
 
-        if [[ "$bound_if" == "$interface_name" || "$profile_name" == "$active_connection" || ( "$interface_name" == "$WIFI_IF" && -z "$bound_if" && "$connection_type" == "802-11-wireless" ) ]]; then
+        should_disable="no"
+        if [[ "$bound_if" == "$interface_name" || "$profile_name" == "$active_connection" ]]; then
+            should_disable="yes"
+        elif [[ "$interface_name" == "$WIFI_IF" && -z "$bound_if" && "$connection_type" == "802-11-wireless" ]]; then
+            should_disable="yes"
+        elif [[ "$connection_type" == "802-3-ethernet" && "$profile_name" == *"$interface_name"* ]]; then
+            should_disable="yes"
+        fi
+
+        if [[ "$should_disable" == "yes" ]]; then
             warn "Disabling autoconnect for competing profile '$profile_name' on $interface_name."
             nmcli connection modify "$uuid" connection.autoconnect no >/dev/null 2>&1 || true
             if [[ "$profile_name" == "$active_connection" && -n "$profile_name" && "$profile_name" != "--" ]]; then
                 nmcli connection down "$uuid" >/dev/null 2>&1 || true
             fi
         fi
-    done < <(nmcli -g connection.uuid connection show)
+    done < <(nmcli -t -f UUID connection show)
 }
 
 configure_optional_dhcp_range() {
@@ -318,7 +333,7 @@ ensure_wan_profile() {
     nmcli connection modify "$WAN_PROFILE" \
         connection.interface-name "$WAN_IF" \
         connection.autoconnect yes \
-        connection.autoconnect-priority 1000 \
+        connection.autoconnect-priority 999 \
         ipv4.method auto \
         ipv4.never-default no \
         ipv4.route-metric 100 \
@@ -615,6 +630,9 @@ main() {
     set_managed_interface "$WAN_IF"
     set_managed_interface "$LAN_IF"
     set_managed_interface "$WIFI_IF"
+    bring_interface_up "$WAN_IF"
+    bring_interface_up "$LAN_IF"
+    bring_interface_up "$WIFI_IF"
 
     wlan_mac="$(detect_wlan_mac)"
     ssid="$(ssid_from_mac "$wlan_mac")"
