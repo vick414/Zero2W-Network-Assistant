@@ -3,9 +3,11 @@
 `configure-pi-router.sh` configures a Raspberry Pi Zero 2 W running 64-bit
 Debian/Raspberry Pi OS as a small three-interface routed network appliance.
 
-The script is designed for offline provisioning. It does not install, update, or
-download packages. Required tools such as NetworkManager and `nmcli` must already
-be present on the OS image.
+The script is designed to complete the main router setup even without Internet
+access. Required tools such as NetworkManager and `nmcli` must already be present
+on the OS image. If packet capture is enabled and `tcpdump` is missing, the
+script attempts to install `tcpdump` only when `apt-get` is available and package
+repositories are reachable.
 
 ## Network Layout
 
@@ -33,28 +35,32 @@ NetworkManager shared-mode routing/NAT behavior.
   `netplan-eth0` that could race `WAN-ETH0`.
 - Generates the management Wi-Fi SSID from the last three bytes of the `wlan0`
   MAC address, for example `pi_A1B2C3`.
-- Generates a WPA2-safe random password and stores it in
-  `/root/pi-router-wifi.txt` with `0600` permissions.
-- Reuses an existing valid password on later runs.
-- Optionally configures `eth1-capture.service` when `tcpdump` is already
-  installed.
+- Uses the generated SSID as the default WPA2 password, for example
+  `pi_A1B2C3`. This keeps provisioning simple while still meeting the WPA2
+  minimum passphrase length.
+- Stores Wi-Fi credentials in `/root/pi-router-wifi.txt` with `0600`
+  permissions.
+- Preserves a manually changed password on later runs.
+- Optionally installs `tcpdump` when Internet/package repository access is
+  available, then configures `eth1-capture.service`.
 
 ## Requirements
 
 Essential commands must already be available:
 
 ```bash
-bash nmcli ip systemctl readlink awk sed grep tr od head cut cat chmod mkdir tee cp mv date
+bash nmcli ip systemctl readlink awk sed grep tr head cut cat chmod mkdir tee cp mv date
 ```
 
 Optional commands:
 
-- `tcpdump`: enables rotating packet capture on `eth1`.
+- `tcpdump`: enables rotating packet capture on `eth1`. If missing, the script
+  tries to install it with `apt-get` when repository access is available.
 - `raspi-config` or `iw`: used when available to set the Wi-Fi country.
 - `rfkill`: used when available to unblock Wi-Fi.
 
-The script never runs package installation commands such as `apt update`,
-`apt install`, `pip install`, or similar.
+The script does not install NetworkManager or other required base tools. The only
+package it may install is `tcpdump`, and only for packet capture.
 
 ## Usage
 
@@ -91,9 +97,50 @@ Use `ENABLE_CAPTURE=no` to skip packet capture setup:
 sudo ENABLE_CAPTURE=no ./configure-pi-router.sh
 ```
 
+With `ENABLE_CAPTURE=yes`, if `tcpdump` is missing and the Pi has working access
+to configured Debian/Raspberry Pi package repositories, the script runs:
+
+```bash
+apt-get update
+apt-get install -y tcpdump
+```
+
+If those commands fail, the script skips packet capture and continues.
+
+## Wi-Fi Credentials
+
+By default, the management Wi-Fi SSID and password are the same value:
+
+```text
+SSID:     pi_A1B2C3
+Password: pi_A1B2C3
+```
+
+The suffix comes from the last three bytes of the `wlan0` MAC address. The
+password includes the `pi_` prefix because WPA2 passwords must be at least 8
+characters long; the raw last three MAC bytes are only 6 hex characters.
+
+Credentials are stored in:
+
+```text
+/root/pi-router-wifi.txt
+```
+
+To manually set a different password, run:
+
+```bash
+chmod +x set-pi-router-wifi-password.sh
+sudo ./set-pi-router-wifi-password.sh
+```
+
+The helper prompts for the new password twice, validates that both entries
+match, updates the NetworkManager `MGMT-WIFI` profile, updates
+`/root/pi-router-wifi.txt`, and restarts the Wi-Fi AP profile. Current Wi-Fi
+management clients will disconnect during the restart.
+
 ## Packet Capture
 
-If `tcpdump` is installed, the script creates:
+If `tcpdump` is available or can be installed, the script creates:
 
 ```text
 /etc/systemd/system/eth1-capture.service
@@ -156,6 +203,8 @@ Expected results:
 - `eth1` has `10.0.0.1/24`.
 - `wlan0` has `192.168.50.1/24`.
 - The management AP SSID starts with `pi_`.
+- The default management AP password matches the SSID unless it was manually
+  changed with `set-pi-router-wifi-password.sh`.
 - The credentials file is readable only by root.
 - `eth1-capture.service` is active when capture is enabled and `tcpdump` exists.
 

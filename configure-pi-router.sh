@@ -69,9 +69,12 @@ The three networks remain separate routed networks. The script does not create a
 Layer 2 bridge.
 
 Offline behavior:
-  This script is designed to work without Internet access. It does not run package
-  installation, package update, language package manager, or download commands.
-  NetworkManager and the required base commands must already be present.
+  This script is designed to complete the main router configuration without
+  Internet access. NetworkManager and the required base commands must already be
+  present. If packet capture is enabled, tcpdump is missing, apt-get exists, and
+  package repositories are reachable, the script attempts to install tcpdump.
+  If that install attempt fails, packet capture is skipped and router setup
+  continues.
 
 Environment overrides:
   WIFI_COUNTRY=US       Wi-Fi regulatory country used when supported.
@@ -85,8 +88,14 @@ Created or updated NetworkManager profiles:
 
 Created or updated files:
   /root/pi-router-wifi.txt
-  /etc/systemd/system/eth1-capture.service, only when tcpdump is installed and capture is enabled.
+  /etc/systemd/system/eth1-capture.service, only when tcpdump is available and capture is enabled.
   /var/log/pcap, only when packet capture is configured.
+
+Default Wi-Fi credentials:
+  The SSID is generated from the last three bytes of the wlan0 MAC address, for
+  example pi_A1B2C3. The default password is the same value as the SSID because
+  WPA2 requires at least 8 characters. A manual password stored with
+  set-pi-router-wifi-password.sh is preserved on later runs.
 
 Notes:
   A temporary network interruption is possible while NetworkManager profiles are
@@ -101,12 +110,12 @@ require_root() {
 
 require_command() {
     local command_name="$1"
-    command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is missing. Install it before running this script; this script will not install packages."
+    command -v "$command_name" >/dev/null 2>&1 || fail "Required command '$command_name' is missing. Install it before running this script. Only tcpdump can be installed automatically, and only when packet capture is enabled and package repositories are reachable."
 }
 
 require_base_commands() {
     local required_commands=(
-        bash nmcli ip systemctl readlink awk sed grep tr od head cut cat chmod mkdir tee cp mv date
+        bash nmcli ip systemctl readlink awk sed grep tr head cut cat chmod mkdir tee cp mv date
     )
     local command_name
 
@@ -217,12 +226,8 @@ valid_wifi_password() {
     local value="$1"
     local length="${#value}"
 
-    (( length >= 20 && length <= 63 )) || return 1
-    [[ "$value" =~ ^[A-Za-z0-9]+$ ]]
-}
-
-generate_wifi_password() {
-    od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | tr '[:lower:]' '[:upper:]'
+    (( length >= 8 && length <= 63 )) || return 1
+    [[ "$value" =~ ^[[:graph:]]+$ ]]
 }
 
 read_saved_value() {
@@ -233,29 +238,38 @@ read_saved_value() {
 
 load_or_create_credentials() {
     local ssid="$1"
+    local default_password="$ssid"
     local saved_ssid=""
     local saved_password=""
+    local saved_source=""
     local password=""
     local temporary_file=""
 
     if [[ -r "$CREDENTIALS_FILE" ]]; then
         saved_ssid="$(read_saved_value "SSID" "$CREDENTIALS_FILE" || true)"
         saved_password="$(read_saved_value "PASSWORD" "$CREDENTIALS_FILE" || true)"
-        if [[ "$saved_ssid" == "$ssid" ]] && valid_wifi_password "$saved_password"; then
+        saved_source="$(read_saved_value "PASSWORD_SOURCE" "$CREDENTIALS_FILE" || true)"
+        if [[ "$saved_ssid" == "$ssid" ]] && valid_wifi_password "$saved_password" && [[ "$saved_source" == "manual" ]]; then
             chmod 600 "$CREDENTIALS_FILE"
             printf '%s\n' "$saved_password"
             return 0
         fi
-        warn "$CREDENTIALS_FILE is missing valid credentials for this SSID. A new password will be generated."
+        if [[ "$saved_ssid" == "$ssid" && "$saved_password" == "$default_password" ]]; then
+            chmod 600 "$CREDENTIALS_FILE"
+            printf '%s\n' "$saved_password"
+            return 0
+        fi
+        warn "$CREDENTIALS_FILE does not contain the current default or a manual password for this SSID. The default MAC-based password will be written."
     fi
 
-    password="$(generate_wifi_password)"
-    valid_wifi_password "$password" || fail "Generated Wi-Fi password did not pass validation."
+    password="$default_password"
+    valid_wifi_password "$password" || fail "Default Wi-Fi password did not pass validation."
 
     temporary_file="${CREDENTIALS_FILE}.$$"
     {
         printf 'SSID=%s\n' "$ssid"
         printf 'PASSWORD=%s\n' "$password"
+        printf 'PASSWORD_SOURCE=default\n'
         printf 'MANAGEMENT_IP=%s\n' "$MGMT_IP"
     } | tee "$temporary_file" >/dev/null
     chmod 600 "$temporary_file"
@@ -476,6 +490,49 @@ check_wan_overlap() {
     fi
 }
 
+install_tcpdump_if_online() {
+    if command -v tcpdump >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "tcpdump is not installed and apt-get is unavailable. Packet capture service will be skipped."
+        return 1
+    fi
+
+    if ! ip -4 route show default >/dev/null 2>&1 || [[ -z "$(ip -4 route show default 2>/dev/null | head -n 1)" ]]; then
+        warn "tcpdump is not installed and no IPv4 default route is currently available. Packet capture service will be skipped."
+        return 1
+    fi
+
+    info "tcpdump is not installed. Attempting to install it because a default route is available."
+    if ! apt-get \
+        -o Acquire::Retries=0 \
+        -o Acquire::http::Timeout=10 \
+        -o Acquire::https::Timeout=10 \
+        update; then
+        warn "apt-get update failed. Internet or package repositories are unavailable. Packet capture service will be skipped."
+        return 1
+    fi
+
+    if ! apt-get \
+        -o Acquire::Retries=0 \
+        -o Acquire::http::Timeout=10 \
+        -o Acquire::https::Timeout=10 \
+        install -y tcpdump; then
+        warn "apt-get install tcpdump failed. Packet capture service will be skipped."
+        return 1
+    fi
+
+    command -v tcpdump >/dev/null 2>&1 || {
+        warn "tcpdump installation completed but tcpdump is still not available in PATH. Packet capture service will be skipped."
+        return 1
+    }
+
+    ok "tcpdump installed."
+    return 0
+}
+
 configure_capture_service() {
     local bash_path=""
     local tcpdump_path=""
@@ -491,9 +548,9 @@ configure_capture_service() {
         return 0
     fi
 
-    if ! command -v tcpdump >/dev/null 2>&1; then
+    if ! command -v tcpdump >/dev/null 2>&1 && ! install_tcpdump_if_online; then
         CAPTURE_STATUS="skipped because tcpdump is unavailable"
-        warn "tcpdump is not installed. Packet capture service was skipped."
+        warn "tcpdump is unavailable. Packet capture service was skipped."
         return 0
     fi
 
