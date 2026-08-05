@@ -511,8 +511,10 @@ configure_capture_service() {
     {
         printf '[Unit]\n'
         printf 'Description=Rotating packet capture on %s\n' "$LAN_IF"
-        printf 'After=NetworkManager.service network-online.target\n'
+        printf 'BindsTo=sys-subsystem-net-devices-%s.device\n' "$LAN_IF"
+        printf 'After=sys-subsystem-net-devices-%s.device NetworkManager.service network-online.target\n' "$LAN_IF"
         printf 'Wants=network-online.target\n'
+        printf 'ConditionPathExists=/sys/class/net/%s\n' "$LAN_IF"
         printf '\n[Service]\n'
         printf 'Type=simple\n'
         printf 'ExecStart=%s -i %s -nn -s 0 -U -C %s -W %s -w %s/eth1.pcap\n' "$tcpdump_path" "$LAN_IF" "$PCAP_SIZE_MB" "$PCAP_FILE_COUNT" "$PCAP_DIRECTORY"
@@ -520,6 +522,7 @@ configure_capture_service() {
         printf 'RestartSec=5\n'
         printf '\n[Install]\n'
         printf 'WantedBy=multi-user.target\n'
+        printf 'WantedBy=sys-subsystem-net-devices-%s.device\n' "$LAN_IF"
     } | tee "$temporary_service" >/dev/null
     chmod 644 "$temporary_service"
     mv "$temporary_service" "$CAPTURE_SERVICE"
