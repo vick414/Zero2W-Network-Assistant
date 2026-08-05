@@ -32,7 +32,7 @@ LAN_DHCP_RANGE_DISPLAY="10.0.0.100-10.0.0.250"
 CREDENTIALS_FILE="/root/pi-router-wifi.txt"
 PCAP_DIRECTORY="/var/log/pcap"
 CAPTURE_SERVICE="/etc/systemd/system/eth1-capture.service"
-PCAP_SIZE_MB="50"
+PCAP_SIZE_MB="200"
 PCAP_FILE_COUNT="10"
 
 CAPTURE_STATUS="disabled"
@@ -477,6 +477,7 @@ check_wan_overlap() {
 }
 
 configure_capture_service() {
+    local bash_path=""
     local tcpdump_path=""
     local timestamp=""
     local temporary_service=""
@@ -496,6 +497,7 @@ configure_capture_service() {
         return 0
     fi
 
+    bash_path="$(command -v bash)"
     tcpdump_path="$(command -v tcpdump)"
     mkdir -p "$PCAP_DIRECTORY"
     chmod 700 "$PCAP_DIRECTORY"
@@ -517,7 +519,7 @@ configure_capture_service() {
         printf 'ConditionPathExists=/sys/class/net/%s\n' "$LAN_IF"
         printf '\n[Service]\n'
         printf 'Type=simple\n'
-        printf 'ExecStart=%s -i %s -nn -s 0 -U -C %s -W %s -w %s/eth1.pcap\n' "$tcpdump_path" "$LAN_IF" "$PCAP_SIZE_MB" "$PCAP_FILE_COUNT" "$PCAP_DIRECTORY"
+        printf 'ExecStart=%s -c '\''exec "$0" -i "$1" -nn -s 0 -U -C "$2" -W "$3" -w "$4/eth1-$(date +%%%%Y%%%%m%%%%d-%%%%H%%%%M%%%%S).pcap"'\'' %s %s %s %s %s\n' "$bash_path" "$tcpdump_path" "$LAN_IF" "$PCAP_SIZE_MB" "$PCAP_FILE_COUNT" "$PCAP_DIRECTORY"
         printf 'Restart=on-failure\n'
         printf 'RestartSec=5\n'
         printf '\n[Install]\n'
