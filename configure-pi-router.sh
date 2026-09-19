@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Configure a Raspberry Pi OS system as a three-interface routed network appliance.
-# This script is intentionally offline-safe: it never installs, updates, or downloads packages.
+# This script is offline-safe for router setup; tcpdump may be installed when repositories are reachable.
 
 set -Eeuo pipefail
 
@@ -30,6 +30,7 @@ LAN_DHCP_RANGE="10.0.0.100,10.0.0.250"
 LAN_DHCP_RANGE_DISPLAY="10.0.0.100-10.0.0.250"
 
 CREDENTIALS_FILE="/root/pi-router-wifi.txt"
+INTERFACE_UP_SERVICE="/etc/systemd/system/pi-router-interfaces-up.service"
 PCAP_DIRECTORY="/var/log/pcap"
 CAPTURE_SERVICE="/etc/systemd/system/eth1-capture.service"
 CAPTURE_HELPER="/usr/local/sbin/eth1-capture-start.sh"
@@ -89,6 +90,7 @@ Created or updated NetworkManager profiles:
 
 Created or updated files:
   /root/pi-router-wifi.txt
+  /etc/systemd/system/pi-router-interfaces-up.service
   /etc/systemd/system/eth1-capture.service, only when tcpdump is available and capture is enabled.
   /var/log/pcap, only when packet capture is configured.
 
@@ -174,6 +176,38 @@ set_managed_interface() {
 bring_interface_up() {
     local interface_name="$1"
     ip link set "$interface_name" up >/dev/null 2>&1 || warn "Could not force $interface_name administratively up; NetworkManager will still try to activate it."
+}
+
+configure_interface_up_service() {
+    local ip_path=""
+    local temporary_service=""
+
+    ip_path="$(command -v ip)"
+    temporary_service="${INTERFACE_UP_SERVICE}.$$"
+
+    {
+        printf '[Unit]\n'
+        printf 'Description=Keep Raspberry Pi router Ethernet interfaces administratively up\n'
+        printf 'Wants=NetworkManager.service sys-subsystem-net-devices-%s.device sys-subsystem-net-devices-%s.device\n' "$WAN_IF" "$LAN_IF"
+        printf 'After=NetworkManager.service sys-subsystem-net-devices-%s.device sys-subsystem-net-devices-%s.device\n' "$WAN_IF" "$LAN_IF"
+        printf '\n[Service]\n'
+        printf 'Type=oneshot\n'
+        printf 'ExecStart=%s link set dev %s up\n' "$ip_path" "$WAN_IF"
+        printf 'ExecStart=%s link set dev %s up\n' "$ip_path" "$LAN_IF"
+        printf 'RemainAfterExit=yes\n'
+        printf '\n[Install]\n'
+        printf 'WantedBy=multi-user.target\n'
+    } | tee "$temporary_service" >/dev/null
+
+    chmod 644 "$temporary_service"
+    mv "$temporary_service" "$INTERFACE_UP_SERVICE"
+    systemctl daemon-reload
+
+    if systemctl enable --now pi-router-interfaces-up.service >/dev/null 2>&1; then
+        ok "$WAN_IF and $LAN_IF will be brought administratively up at every boot."
+    else
+        warn "The Ethernet interface-up service was written, but systemctl could not enable or start it."
+    fi
 }
 
 normalize_enable_capture() {
@@ -584,11 +618,12 @@ configure_capture_service() {
         printf '[Unit]\n'
         printf 'Description=Rotating packet capture on %s\n' "$LAN_IF"
         printf 'BindsTo=sys-subsystem-net-devices-%s.device\n' "$LAN_IF"
-        printf 'After=sys-subsystem-net-devices-%s.device NetworkManager.service network-online.target\n' "$LAN_IF"
-        printf 'Wants=network-online.target\n'
+        printf 'After=sys-subsystem-net-devices-%s.device NetworkManager.service pi-router-interfaces-up.service\n' "$LAN_IF"
+        printf 'Wants=pi-router-interfaces-up.service\n'
         printf 'ConditionPathExists=/sys/class/net/%s\n' "$LAN_IF"
         printf '\n[Service]\n'
         printf 'Type=simple\n'
+        printf 'ExecStartPre=%s link set dev %s up\n' "$(command -v ip)" "$LAN_IF"
         printf 'ExecStart=%s\n' "$CAPTURE_HELPER"
         printf 'Restart=on-failure\n'
         printf 'RestartSec=5\n'
@@ -666,6 +701,10 @@ WAN:
   Address: $wan_address
   Default route: $default_route
 
+Ethernet interface startup:
+  Service: pi-router-interfaces-up.service
+  Interfaces: $WAN_IF, $LAN_IF
+
 Packet capture:
   Status: $CAPTURE_STATUS
   Directory: $PCAP_DIRECTORY
@@ -719,6 +758,7 @@ main() {
     check_wan_overlap
     ensure_lan_profile
     ensure_wifi_profile "$ssid" "$wifi_password"
+    configure_interface_up_service
     configure_capture_service
     check_wan_overlap
 
