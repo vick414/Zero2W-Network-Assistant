@@ -30,7 +30,7 @@ LAN_DHCP_RANGE="10.0.0.100,10.0.0.250"
 LAN_DHCP_RANGE_DISPLAY="10.0.0.100-10.0.0.250"
 
 CREDENTIALS_FILE="/root/pi-router-wifi.txt"
-INTERFACE_UP_SERVICE="/etc/systemd/system/pi-router-interfaces-up.service"
+LEGACY_INTERFACE_UP_SERVICE="/etc/systemd/system/pi-router-interfaces-up.service"
 PCAP_DIRECTORY="/var/log/pcap"
 CAPTURE_SERVICE="/etc/systemd/system/eth1-capture.service"
 CAPTURE_HELPER="/usr/local/sbin/eth1-capture-start.sh"
@@ -90,7 +90,6 @@ Created or updated NetworkManager profiles:
 
 Created or updated files:
   /root/pi-router-wifi.txt
-  /etc/systemd/system/pi-router-interfaces-up.service
   /etc/systemd/system/eth1-capture.service, only when tcpdump is available and capture is enabled.
   /var/log/pcap, only when packet capture is configured.
 
@@ -118,7 +117,7 @@ require_command() {
 
 require_base_commands() {
     local required_commands=(
-        bash nmcli ip systemctl readlink awk sed grep tr head cut cat chmod mkdir tee cp mv date
+        bash nmcli ip systemctl readlink awk sed grep tr head cut cat chmod mkdir tee cp mv rm date
     )
     local command_name
 
@@ -178,36 +177,20 @@ bring_interface_up() {
     ip link set "$interface_name" up >/dev/null 2>&1 || warn "Could not force $interface_name administratively up; NetworkManager will still try to activate it."
 }
 
-configure_interface_up_service() {
-    local ip_path=""
-    local temporary_service=""
-
-    ip_path="$(command -v ip)"
-    temporary_service="${INTERFACE_UP_SERVICE}.$$"
-
-    {
-        printf '[Unit]\n'
-        printf 'Description=Keep Raspberry Pi router Ethernet interfaces administratively up\n'
-        printf 'Wants=NetworkManager.service sys-subsystem-net-devices-%s.device sys-subsystem-net-devices-%s.device\n' "$WAN_IF" "$LAN_IF"
-        printf 'After=NetworkManager.service sys-subsystem-net-devices-%s.device sys-subsystem-net-devices-%s.device\n' "$WAN_IF" "$LAN_IF"
-        printf '\n[Service]\n'
-        printf 'Type=oneshot\n'
-        printf 'ExecStart=%s link set dev %s up\n' "$ip_path" "$WAN_IF"
-        printf 'ExecStart=%s link set dev %s up\n' "$ip_path" "$LAN_IF"
-        printf 'RemainAfterExit=yes\n'
-        printf '\n[Install]\n'
-        printf 'WantedBy=multi-user.target\n'
-    } | tee "$temporary_service" >/dev/null
-
-    chmod 644 "$temporary_service"
-    mv "$temporary_service" "$INTERFACE_UP_SERVICE"
-    systemctl daemon-reload
-
-    if systemctl enable --now pi-router-interfaces-up.service >/dev/null 2>&1; then
-        ok "$WAN_IF and $LAN_IF will be brought administratively up at every boot."
-    else
-        warn "The Ethernet interface-up service was written, but systemctl could not enable or start it."
+remove_legacy_interface_up_service() {
+    if [[ ! -f "$LEGACY_INTERFACE_UP_SERVICE" ]]; then
+        return 0
     fi
+
+    if ! grep -Fq 'Description=Keep Raspberry Pi router Ethernet interfaces administratively up' "$LEGACY_INTERFACE_UP_SERVICE"; then
+        warn "Found $LEGACY_INTERFACE_UP_SERVICE, but it was not created by this script; leaving it unchanged."
+        return 0
+    fi
+
+    systemctl disable --now pi-router-interfaces-up.service >/dev/null 2>&1 || true
+    rm -f "$LEGACY_INTERFACE_UP_SERVICE"
+    systemctl daemon-reload
+    ok "Removed the obsolete pi-router-interfaces-up.service."
 }
 
 normalize_enable_capture() {
@@ -618,8 +601,7 @@ configure_capture_service() {
         printf '[Unit]\n'
         printf 'Description=Rotating packet capture on %s\n' "$LAN_IF"
         printf 'BindsTo=sys-subsystem-net-devices-%s.device\n' "$LAN_IF"
-        printf 'After=sys-subsystem-net-devices-%s.device NetworkManager.service pi-router-interfaces-up.service\n' "$LAN_IF"
-        printf 'Wants=pi-router-interfaces-up.service\n'
+        printf 'After=sys-subsystem-net-devices-%s.device NetworkManager.service\n' "$LAN_IF"
         printf 'ConditionPathExists=/sys/class/net/%s\n' "$LAN_IF"
         printf '\n[Service]\n'
         printf 'Type=simple\n'
@@ -701,10 +683,6 @@ WAN:
   Address: $wan_address
   Default route: $default_route
 
-Ethernet interface startup:
-  Service: pi-router-interfaces-up.service
-  Interfaces: $WAN_IF, $LAN_IF
-
 Packet capture:
   Status: $CAPTURE_STATUS
   Directory: $PCAP_DIRECTORY
@@ -758,7 +736,7 @@ main() {
     check_wan_overlap
     ensure_lan_profile
     ensure_wifi_profile "$ssid" "$wifi_password"
-    configure_interface_up_service
+    remove_legacy_interface_up_service
     configure_capture_service
     check_wan_overlap
 

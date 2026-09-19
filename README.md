@@ -148,22 +148,14 @@ If `tcpdump` is available or can be installed, the script creates:
 /var/log/pcap
 ```
 
-The script also creates and enables:
-
-```text
-/etc/systemd/system/pi-router-interfaces-up.service
-```
-
-This oneshot service sets both `eth0` and `eth1` administratively up at every
-boot, even when no Ethernet cables are connected. Without a cable, Linux still
-reports `NO-CARRIER`; this is expected and does not mean the interface is
-administratively down.
-
 The service runs `/usr/local/sbin/eth1-capture-start.sh`, which attaches
 `tcpdump` directly to `eth1` as soon as the interface exists. This is
 intentional: it allows capture of the first DHCP, ARP, or other packets
 immediately after link-up. The helper runs `tcpdump` with `-Z root` so Debian's
 tcpdump privilege dropping does not prevent writing to `/var/log/pcap`.
+Before starting `tcpdump`, the capture service sets `eth1` administratively up.
+NetworkManager manages normal startup and link detection for both Ethernet
+interfaces, so no separate interface-up service is required.
 
 Capture files use timestamped names:
 
@@ -190,7 +182,6 @@ Useful commands:
 ```bash
 systemctl status eth1-capture.service
 systemctl cat eth1-capture.service
-systemctl status pi-router-interfaces-up.service
 ip -br link show eth0 eth1
 pgrep -a tcpdump
 sudo ls -lh /var/log/pcap
@@ -209,7 +200,6 @@ ip -4 addr show wlan0
 ip -4 route
 sudo cat /root/pi-router-wifi.txt
 systemctl status eth1-capture.service
-systemctl status pi-router-interfaces-up.service
 ```
 
 Expected results:
@@ -225,7 +215,6 @@ Expected results:
 - The default management AP password matches the SSID unless it was manually
   changed with `set-pi-router-wifi-password.sh`.
 - The credentials file is readable only by root.
-- `pi-router-interfaces-up.service` is enabled and active (exited).
 - `eth1-capture.service` is active when capture is enabled and `tcpdump` exists.
 
 ## Rollback
@@ -234,12 +223,6 @@ Disable packet capture:
 
 ```bash
 sudo systemctl disable --now eth1-capture.service
-```
-
-Disable automatic administrative startup of the Ethernet interfaces:
-
-```bash
-sudo systemctl disable --now pi-router-interfaces-up.service
 ```
 
 Remove the NetworkManager profiles created by the script:
