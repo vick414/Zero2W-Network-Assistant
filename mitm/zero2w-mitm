@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# Operator command for the optional Zero2W transparent MITM subsystem.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_MITM_COMMON:-/usr/local/libexec/zero2w-mitm-common}"
+FIREWALL_HELPER="${ZERO2W_MITM_FIREWALL:-/usr/local/libexec/zero2w-mitm-firewall}"
+SERVICE_NAME="${ZERO2W_MITM_SERVICE:-zero2w-mitm.service}"
+
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+usage() {
+    cat <<'EOF_HELP'
+Usage:
+  sudo zero2w-mitm enable web
+  sudo zero2w-mitm enable tcp
+  sudo zero2w-mitm disable
+  sudo zero2w-mitm restart
+  sudo zero2w-mitm status
+
+Modes:
+  web  Redirect TCP ports 80 and 443 arriving from the device LAN.
+  tcp  Redirect all TCP arriving from the device LAN; UDP is unaffected.
+EOF_HELP
+}
+
+write_mode() {
+    local mode="$1"
+    local mode_directory=""
+    local temporary_file=""
+
+    mode_directory="${MITM_MODE_FILE%/*}"
+    mkdir -p "$mode_directory"
+    chmod 755 "$mode_directory"
+    temporary_file="${MITM_MODE_FILE}.$$"
+    printf '%s\n' "$mode" > "$temporary_file"
+    chmod 644 "$temporary_file"
+    mv "$temporary_file" "$MITM_MODE_FILE"
+}
+
+validate_enable_prerequisites() {
+    local mode="$1"
+
+    mitm_valid_mode "$mode" || {
+        mitm_fail "Mode must be web or tcp."
+        return 1
+    }
+    mitm_command_path "$MITM_MITMDUMP_BIN" >/dev/null || {
+        mitm_fail "mitmdump is unavailable. Install mitmproxy and configure MITM_MITMDUMP_BIN."
+        return 1
+    }
+    mitm_command_path "$MITM_IPTABLES_BIN" >/dev/null || {
+        mitm_fail "iptables is required for transparent interception."
+        return 1
+    }
+    [[ -x "$FIREWALL_HELPER" ]] || {
+        mitm_fail "Firewall helper is missing or not executable: $FIREWALL_HELPER"
+        return 1
+    }
+}
+
+enable_mode() {
+    local mode="$1"
+
+    validate_enable_prerequisites "$mode"
+    write_mode "$mode"
+
+    # A restart always executes the service cleanup hooks before changing mode.
+    if "$SYSTEMCTL_PATH" is-active --quiet "$SERVICE_NAME"; then
+        if ! "$SYSTEMCTL_PATH" restart "$SERVICE_NAME"; then
+            "$FIREWALL_HELPER" remove || true
+            mitm_fail "Failed to restart $SERVICE_NAME; project firewall rules were removed."
+            return 1
+        fi
+    elif ! "$SYSTEMCTL_PATH" start "$SERVICE_NAME"; then
+        "$FIREWALL_HELPER" remove || true
+        mitm_fail "Failed to start $SERVICE_NAME; project firewall rules were removed."
+        return 1
+    fi
+
+    if ! "$SYSTEMCTL_PATH" is-active --quiet "$SERVICE_NAME"; then
+        "$FIREWALL_HELPER" remove || true
+        mitm_fail "$SERVICE_NAME did not remain active; project firewall rules were removed."
+        return 1
+    fi
+
+    mitm_ok "Transparent MITM enabled in $mode mode."
+    show_status
+}
+
+disable_mitm() {
+    # Remove redirection before stopping the listener so client TCP fails open.
+    "$FIREWALL_HELPER" remove
+    "$SYSTEMCTL_PATH" disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+    mitm_ok "Transparent MITM disabled; normal NetworkManager routing remains active."
+}
+
+show_status() {
+    local mode=""
+    local service_state="inactive"
+    local boot_state="disabled"
+    local forwarding="unknown"
+    local send_redirects="unknown"
+    local mitmdump_path=""
+    local mitmdump_version="unavailable"
+
+    mode="$(mitm_configured_mode)" || mode="invalid"
+    service_state="$($SYSTEMCTL_PATH is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    boot_state="$($SYSTEMCTL_PATH is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+    forwarding="$($SYSCTL_PATH -n net.ipv4.ip_forward 2>/dev/null || true)"
+    send_redirects="$($SYSCTL_PATH -n net.ipv4.conf.all.send_redirects 2>/dev/null || true)"
+    mitmdump_path="$(mitm_command_path "$MITM_MITMDUMP_BIN" || true)"
+    if [[ -n "$mitmdump_path" ]]; then
+        mitmdump_version="$("$mitmdump_path" --version 2>/dev/null | head -n 1 || true)"
+    fi
+
+    cat <<EOF_STATUS
+Configured mode: $mode
+Service state: ${service_state:-inactive}
+Start at boot: ${boot_state:-disabled}
+Listener: $MITM_LISTEN_HOST:$MITM_PORT
+LAN interface: $MITM_LAN_IF
+IPv4 forwarding: ${forwarding:-unknown}
+IPv4 send redirects: ${send_redirects:-unknown}
+Flow directory: $MITM_FLOW_DIR
+CA certificate: $MITM_CONF_DIR/mitmproxy-ca-cert.pem
+mitmdump binary: ${mitmdump_path:-unavailable}
+mitmproxy version: ${mitmdump_version:-unknown}
+EOF_STATUS
+
+    "$FIREWALL_HELPER" status
+}
+
+main() {
+    local command_name="${1:-status}"
+    local mode=""
+
+    mitm_require_root || exit 1
+    mitm_load_config
+    mitm_validate_config || exit 1
+    SYSTEMCTL_PATH="$(mitm_command_path "$MITM_SYSTEMCTL_BIN")" || {
+        mitm_fail "systemctl is required."
+        exit 1
+    }
+    SYSCTL_PATH="$(mitm_command_path "$MITM_SYSCTL_BIN")" || {
+        mitm_fail "sysctl is required."
+        exit 1
+    }
+
+    case "$command_name" in
+        enable)
+            [[ "$#" -eq 2 ]] || {
+                usage >&2
+                exit 2
+            }
+            enable_mode "$2"
+            ;;
+        disable)
+            [[ "$#" -eq 1 ]] || {
+                usage >&2
+                exit 2
+            }
+            disable_mitm
+            ;;
+        restart)
+            [[ "$#" -eq 1 ]] || {
+                usage >&2
+                exit 2
+            }
+            mode="$(mitm_configured_mode)"
+            enable_mode "$mode"
+            ;;
+        status)
+            [[ "$#" -eq 1 ]] || {
+                usage >&2
+                exit 2
+            }
+            show_status
+            ;;
+        --help|-h|help)
+            usage
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

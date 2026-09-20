@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+state_file="${MOCK_SYSTEMCTL_STATE:?MOCK_SYSTEMCTL_STATE is required}"
+[[ -f "$state_file" ]] || printf 'inactive\n' > "$state_file"
+
+action="${1:-}"
+shift || true
+
+case "$action" in
+    is-active)
+        [[ "${1:-}" == "--quiet" ]] && shift
+        state="$(<"$state_file")"
+        if [[ "$state" == "active" ]]; then
+            [[ "${ZERO2W_MITM_QUIET_STATUS:-no}" == "yes" ]] || printf 'active\n'
+            exit 0
+        fi
+        [[ "${ZERO2W_MITM_QUIET_STATUS:-no}" == "yes" ]] || printf 'inactive\n'
+        exit 3
+        ;;
+    is-enabled)
+        printf 'disabled\n'
+        exit 1
+        ;;
+    start|restart)
+        printf 'active\n' > "$state_file"
+        ;;
+    stop)
+        printf 'inactive\n' > "$state_file"
+        ;;
+    disable)
+        if [[ "${1:-}" == "--now" ]]; then
+            printf 'inactive\n' > "$state_file"
+        fi
+        ;;
+    *)
+        ;;
+esac

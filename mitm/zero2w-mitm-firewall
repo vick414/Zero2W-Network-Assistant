@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+# Manage only the isolated ZERO2W_MITM chain in the IPv4 nat table.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_MITM_COMMON:-/usr/local/libexec/zero2w-mitm-common}"
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+CHAIN="ZERO2W_MITM"
+COMMENT="zero2w-mitm"
+
+usage() {
+    cat <<'EOF_HELP'
+Usage: zero2w-mitm-firewall apply|remove|status
+
+Internal helper for the Zero2W transparent MITM systemd service.
+EOF_HELP
+}
+
+iptables_cmd() {
+    "$IPTABLES_PATH" -w 5 -t nat "$@"
+}
+
+chain_exists() {
+    iptables_cmd -S "$CHAIN" >/dev/null 2>&1
+}
+
+jump_exists_for_interface() {
+    local interface_name="$1"
+    iptables_cmd -C PREROUTING -i "$interface_name" -p tcp \
+        -m comment --comment "$COMMENT" -j "$CHAIN" >/dev/null 2>&1
+}
+
+remove_jump_for_interface() {
+    local interface_name="$1"
+
+    while jump_exists_for_interface "$interface_name"; do
+        iptables_cmd -D PREROUTING -i "$interface_name" -p tcp \
+            -m comment --comment "$COMMENT" -j "$CHAIN"
+    done
+}
+
+remove_jump_rules() {
+    local previous_interface=""
+
+    remove_jump_for_interface "$MITM_LAN_IF"
+    if [[ -r "$MITM_FIREWALL_STATE_FILE" ]]; then
+        IFS= read -r previous_interface < "$MITM_FIREWALL_STATE_FILE" || true
+        if [[ "$previous_interface" =~ ^[[:alnum:]_.:-]{1,15}$ && "$previous_interface" != "$MITM_LAN_IF" ]]; then
+            remove_jump_for_interface "$previous_interface"
+        fi
+    fi
+}
+
+write_firewall_state() {
+    local state_directory="${MITM_FIREWALL_STATE_FILE%/*}"
+    local temporary_file="${MITM_FIREWALL_STATE_FILE}.$$"
+
+    mkdir -p "$state_directory"
+    printf '%s\n' "$MITM_LAN_IF" > "$temporary_file"
+    chmod 600 "$temporary_file"
+    mv "$temporary_file" "$MITM_FIREWALL_STATE_FILE"
+}
+
+append_if_missing() {
+    if ! iptables_cmd -C "$CHAIN" "$@" >/dev/null 2>&1; then
+        iptables_cmd -A "$CHAIN" "$@"
+    fi
+}
+
+remove_rules() {
+    remove_jump_rules
+
+    if chain_exists; then
+        iptables_cmd -F "$CHAIN"
+        iptables_cmd -X "$CHAIN"
+    fi
+    rm -f "$MITM_FIREWALL_STATE_FILE"
+}
+
+apply_rules() {
+    local mode=""
+    local cidr=""
+
+    mode="$(mitm_configured_mode)" || return 1
+
+    # Build the project chain while detached, then add the PREROUTING jump last.
+    remove_jump_rules || return 1
+    if ! chain_exists; then
+        iptables_cmd -N "$CHAIN" || return 1
+    fi
+    iptables_cmd -F "$CHAIN" || return 1
+
+    append_if_missing -m addrtype --dst-type LOCAL \
+        -m comment --comment "$COMMENT-bypass-local" -j RETURN || return 1
+
+    for cidr in $MITM_BYPASS_CIDRS; do
+        append_if_missing -d "$cidr" \
+            -m comment --comment "$COMMENT-bypass" -j RETURN || return 1
+    done
+
+    case "$mode" in
+        web)
+            append_if_missing -p tcp -m multiport --dports 80,443 \
+                -m comment --comment "$COMMENT-web" \
+                -j REDIRECT --to-ports "$MITM_PORT" || return 1
+            ;;
+        tcp)
+            append_if_missing -p tcp \
+                -m comment --comment "$COMMENT-tcp" \
+                -j REDIRECT --to-ports "$MITM_PORT" || return 1
+            ;;
+        *)
+            mitm_fail "Unsupported MITM mode: $mode"
+            return 1
+            ;;
+    esac
+
+    if ! jump_exists_for_interface "$MITM_LAN_IF"; then
+        iptables_cmd -I PREROUTING 1 -i "$MITM_LAN_IF" -p tcp \
+            -m comment --comment "$COMMENT" -j "$CHAIN" || return 1
+    fi
+    write_firewall_state || return 1
+}
+
+show_status() {
+    if jump_exists_for_interface "$MITM_LAN_IF"; then
+        printf 'Firewall redirect: enabled\n'
+    else
+        printf 'Firewall redirect: disabled\n'
+    fi
+
+    if chain_exists; then
+        iptables_cmd -L "$CHAIN" -n -v --line-numbers
+    else
+        printf 'Chain %s: absent\n' "$CHAIN"
+    fi
+}
+
+main() {
+    local action="${1:-}"
+
+    [[ "$#" -eq 1 ]] || {
+        usage >&2
+        exit 2
+    }
+
+    mitm_require_root || exit 1
+    mitm_load_config
+    mitm_validate_config || exit 1
+    IPTABLES_PATH="$(mitm_command_path "$MITM_IPTABLES_BIN")" || {
+        mitm_fail "Required command '$MITM_IPTABLES_BIN' was not found."
+        exit 1
+    }
+
+    case "$action" in
+        apply)
+            if ! apply_rules; then
+                mitm_warn "Firewall rule installation failed; removing project rules."
+                remove_rules || true
+                exit 1
+            fi
+            ;;
+        remove)
+            remove_rules
+            ;;
+        status)
+            show_status
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

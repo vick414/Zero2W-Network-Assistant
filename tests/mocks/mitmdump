@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+
+if [[ -n "${MOCK_MITMDUMP_ARGS:-}" ]]; then
+    printf '%s\n' "$@" > "$MOCK_MITMDUMP_ARGS"
+fi
+
+exit 0

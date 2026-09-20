@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+
+mitm_info() {
+    printf '[INFO] %s\n' "$*"
+}
+
+mitm_ok() {
+    printf '[OK] %s\n' "$*"
+}
+
+mitm_warn() {
+    printf '[WARNING] %s\n' "$*" >&2
+}
+
+mitm_fail() {
+    printf '[ERROR] %s\n' "$*" >&2
+    return 1
+}
+
+mitm_require_root() {
+    if [[ "${ZERO2W_MITM_TESTING:-no}" != "yes" && "$EUID" -ne 0 ]]; then
+        mitm_fail "Run this command as root."
+        return 1
+    fi
+}
+
+mitm_valid_mode() {
+    [[ "$1" == "web" || "$1" == "tcp" ]]
+}
+
+mitm_valid_ipv4() {
+    local value="$1"
+    local octets=()
+    local octet=""
+
+    IFS=. read -r -a octets <<< "$value"
+    [[ "${#octets[@]}" -eq 4 ]] || return 1
+
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+mitm_valid_cidr() {
+    local value="$1"
+    local address="${value%/*}"
+    local prefix="${value#*/}"
+
+    [[ "$value" == */* ]] || return 1
+    mitm_valid_ipv4 "$address" || return 1
+    [[ "$prefix" =~ ^[0-9]{1,2}$ ]] || return 1
+    (( 10#$prefix <= 32 ))
+}
+
+mitm_command_path() {
+    command -v "$1" 2>/dev/null
+}
+
+mitm_load_config() {
+    ZERO2W_MITM_CONFIG_FILE="${ZERO2W_MITM_CONFIG_FILE:-/etc/default/zero2w-mitm}"
+
+    MITM_LAN_IF="eth1"
+    MITM_LISTEN_HOST="10.0.0.1"
+    MITM_PORT="8080"
+    MITM_DEFAULT_MODE="web"
+    MITM_FLOW_DIR="/var/log/mitmproxy"
+    MITM_STATE_DIR="/var/lib/zero2w-mitm"
+    MITM_CONF_DIR="/var/lib/zero2w-mitm/.mitmproxy"
+    MITM_MODE_FILE="/etc/zero2w-mitm/mode"
+    MITM_FIREWALL_STATE_FILE="/run/zero2w-mitm-firewall-interface"
+    MITM_BYPASS_CIDRS="10.0.0.1/32 192.168.50.0/24"
+    MITM_MITMDUMP_BIN="mitmdump"
+    MITM_IPTABLES_BIN="iptables"
+    MITM_SYSCTL_BIN="sysctl"
+    MITM_SYSTEMCTL_BIN="systemctl"
+
+    if [[ -r "$ZERO2W_MITM_CONFIG_FILE" ]]; then
+        # The configuration is a root-owned /etc/default shell file.
+        # shellcheck disable=SC1090
+        source "$ZERO2W_MITM_CONFIG_FILE"
+    fi
+}
+
+mitm_validate_config() {
+    local cidr=""
+
+    [[ "$MITM_LAN_IF" =~ ^[[:alnum:]_.:-]{1,15}$ ]] || {
+        mitm_fail "Invalid MITM_LAN_IF: $MITM_LAN_IF"
+        return 1
+    }
+    mitm_valid_ipv4 "$MITM_LISTEN_HOST" || {
+        mitm_fail "Invalid MITM_LISTEN_HOST: $MITM_LISTEN_HOST"
+        return 1
+    }
+    [[ "$MITM_PORT" =~ ^[0-9]{1,5}$ ]] && (( MITM_PORT >= 1 && MITM_PORT <= 65535 )) || {
+        mitm_fail "MITM_PORT must be between 1 and 65535."
+        return 1
+    }
+    mitm_valid_mode "$MITM_DEFAULT_MODE" || {
+        mitm_fail "MITM_DEFAULT_MODE must be web or tcp."
+        return 1
+    }
+
+    for cidr in $MITM_BYPASS_CIDRS; do
+        mitm_valid_cidr "$cidr" || {
+            mitm_fail "Invalid CIDR in MITM_BYPASS_CIDRS: $cidr"
+            return 1
+        }
+    done
+
+    [[ "$MITM_FLOW_DIR" == /* && "$MITM_STATE_DIR" == /* && "$MITM_CONF_DIR" == /* && "$MITM_MODE_FILE" == /* && "$MITM_FIREWALL_STATE_FILE" == /* ]] || {
+        mitm_fail "MITM directories and state files must use absolute paths."
+        return 1
+    }
+}
+
+mitm_configured_mode() {
+    local mode="$MITM_DEFAULT_MODE"
+
+    if [[ -r "$MITM_MODE_FILE" ]]; then
+        IFS= read -r mode < "$MITM_MODE_FILE" || true
+    fi
+
+    mitm_valid_mode "$mode" || {
+        mitm_fail "Configured MITM mode '$mode' is invalid; expected web or tcp."
+        return 1
+    }
+    printf '%s\n' "$mode"
+}

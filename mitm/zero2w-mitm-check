@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Validate transparent MITM prerequisites before mitmdump starts.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_MITM_COMMON:-/usr/local/libexec/zero2w-mitm-common}"
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+main() {
+    local mode=""
+    local forwarding=""
+    local send_redirects=""
+
+    mitm_load_config
+    mitm_validate_config
+    mode="$(mitm_configured_mode)"
+
+    mitm_command_path "$MITM_MITMDUMP_BIN" >/dev/null || {
+        mitm_fail "mitmdump is unavailable. Install mitmproxy and set MITM_MITMDUMP_BIN in $ZERO2W_MITM_CONFIG_FILE."
+        exit 1
+    }
+    mitm_command_path "$MITM_IPTABLES_BIN" >/dev/null || {
+        mitm_fail "iptables is required for transparent interception."
+        exit 1
+    }
+    SYSCTL_PATH="$(mitm_command_path "$MITM_SYSCTL_BIN")" || {
+        mitm_fail "sysctl is required for transparent interception."
+        exit 1
+    }
+
+    if [[ "${ZERO2W_MITM_TESTING:-no}" != "yes" && ! -d "/sys/class/net/$MITM_LAN_IF" ]]; then
+        mitm_fail "LAN interface '$MITM_LAN_IF' does not exist."
+        exit 1
+    fi
+
+    forwarding="$($SYSCTL_PATH -n net.ipv4.ip_forward 2>/dev/null || true)"
+    [[ "$forwarding" == "1" ]] || {
+        mitm_fail "net.ipv4.ip_forward is $forwarding; activate the NetworkManager shared LAN profile before enabling MITM."
+        exit 1
+    }
+
+    send_redirects="$($SYSCTL_PATH -n net.ipv4.conf.all.send_redirects 2>/dev/null || true)"
+    if [[ "$send_redirects" != "0" ]]; then
+        mitm_warn "net.ipv4.conf.all.send_redirects is $send_redirects. This routed eth1-to-eth0 topology normally does not emit same-interface redirects, so no global sysctl change was made."
+    fi
+
+    mitm_info "MITM prerequisites passed for mode '$mode'."
+}
+
+main "$@"

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+state_dir="${MOCK_IPTABLES_STATE:?MOCK_IPTABLES_STATE is required}"
+mkdir -p "$state_dir/chains"
+touch "$state_dir/prerouting"
+
+if [[ "${1:-}" == "-w" ]]; then
+    shift 2
+fi
+if [[ "${1:-}" == "-t" ]]; then
+    [[ "${2:-}" == "nat" ]] || exit 2
+    shift 2
+fi
+
+action="${1:-}"
+shift || true
+
+serialize() {
+    printf '%q ' "$@"
+    printf '\n'
+}
+
+rules_file() {
+    if [[ "$1" == "PREROUTING" ]]; then
+        printf '%s/prerouting\n' "$state_dir"
+    else
+        printf '%s/rules-%s\n' "$state_dir" "$1"
+    fi
+}
+
+case "$action" in
+    -S)
+        chain="$1"
+        [[ -f "$state_dir/chains/$chain" ]]
+        ;;
+    -N)
+        chain="$1"
+        touch "$state_dir/chains/$chain" "$(rules_file "$chain")"
+        ;;
+    -F)
+        chain="$1"
+        [[ -f "$state_dir/chains/$chain" ]] || exit 1
+        : > "$(rules_file "$chain")"
+        ;;
+    -X)
+        chain="$1"
+        rm -f "$state_dir/chains/$chain" "$(rules_file "$chain")"
+        ;;
+    -C)
+        chain="$1"
+        shift
+        file="$(rules_file "$chain")"
+        [[ -f "$file" ]] || exit 1
+        expected="$(serialize "$@")"
+        grep -Fqx -- "$expected" "$file"
+        ;;
+    -A)
+        chain="$1"
+        shift
+        file="$(rules_file "$chain")"
+        [[ "$chain" == "PREROUTING" || -f "$state_dir/chains/$chain" ]] || exit 1
+        serialize "$@" >> "$file"
+        ;;
+    -I)
+        chain="$1"
+        shift 2
+        file="$(rules_file "$chain")"
+        temporary_file="$file.$$"
+        serialize "$@" > "$temporary_file"
+        cat "$file" >> "$temporary_file"
+        mv "$temporary_file" "$file"
+        ;;
+    -D)
+        chain="$1"
+        shift
+        file="$(rules_file "$chain")"
+        expected="$(serialize "$@")"
+        temporary_file="$file.$$"
+        awk -v expected="$expected" '$0 != expected || removed { print; next } { removed=1 }' "$file" > "$temporary_file"
+        mv "$temporary_file" "$file"
+        ;;
+    -L)
+        chain="$1"
+        file="$(rules_file "$chain")"
+        [[ -f "$state_dir/chains/$chain" ]] || exit 1
+        printf 'mock counters for %s\n' "$chain"
+        cat "$file"
+        ;;
+    *)
+        printf 'Unsupported mock iptables action: %s\n' "$action" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,28 @@
+[Unit]
+Description=Optional Zero2W transparent MITM proxy
+Documentation=https://docs.mitmproxy.org/stable/howto/transparent/
+Wants=NetworkManager.service
+After=NetworkManager.service network.target
+ConditionPathExists=/etc/default/zero2w-mitm
+
+[Service]
+Type=simple
+User=zero2w-mitm
+Group=zero2w-mitm
+UMask=0077
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=+/usr/local/libexec/zero2w-mitm-check
+ExecStart=/usr/local/libexec/zero2w-mitm-run
+ExecStartPost=+/usr/local/libexec/zero2w-mitm-firewall apply
+ExecStop=+/usr/local/libexec/zero2w-mitm-firewall remove
+ExecStopPost=+/usr/local/libexec/zero2w-mitm-firewall remove
+Restart=no
+TimeoutStopSec=20
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/var/lib/zero2w-mitm /var/log/mitmproxy
+
+[Install]
+WantedBy=multi-user.target

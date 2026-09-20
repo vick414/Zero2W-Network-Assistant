@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+case "${*: -1}" in
+    net.ipv4.ip_forward) printf '1\n' ;;
+    net.ipv4.conf.all.send_redirects) printf '0\n' ;;
+    *) exit 1 ;;
+esac

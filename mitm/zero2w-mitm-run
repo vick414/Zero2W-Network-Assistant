@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Run mitmdump as the dedicated unprivileged service account.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_MITM_COMMON:-/usr/local/libexec/zero2w-mitm-common}"
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+main() {
+    local mode=""
+    local mitmdump_path=""
+    local flow_file=""
+    local args=()
+
+    mitm_load_config
+    mitm_validate_config
+    mode="$(mitm_configured_mode)"
+    mitmdump_path="$(mitm_command_path "$MITM_MITMDUMP_BIN")" || {
+        mitm_fail "mitmdump is unavailable."
+        exit 1
+    }
+
+    [[ -d "$MITM_FLOW_DIR" && -w "$MITM_FLOW_DIR" ]] || {
+        mitm_fail "Flow directory is not writable: $MITM_FLOW_DIR"
+        exit 1
+    }
+    [[ -d "$MITM_CONF_DIR" && -w "$MITM_CONF_DIR" ]] || {
+        mitm_fail "mitmproxy state directory is not writable: $MITM_CONF_DIR"
+        exit 1
+    }
+
+    umask 0077
+    flow_file="$MITM_FLOW_DIR/mitm-$(date +%Y%m%d-%H%M%S).flows"
+    args=(
+        --mode transparent
+        --listen-host "$MITM_LISTEN_HOST"
+        --listen-port "$MITM_PORT"
+        --showhost
+        --set "confdir=$MITM_CONF_DIR"
+        --set "save_stream_file=$flow_file"
+    )
+
+    if [[ "$mode" == "tcp" ]]; then
+        args+=(--set 'rawtcp=true' --set 'tcp_hosts=.*')
+    fi
+
+    mitm_info "Starting mitmdump in $mode mode; flows: $flow_file"
+    exec "$mitmdump_path" "${args[@]}"
+}
+
+main "$@"

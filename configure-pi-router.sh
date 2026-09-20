@@ -17,6 +17,14 @@ AP_PROFILE="MGMT-WIFI"
 WIFI_COUNTRY="${WIFI_COUNTRY:-US}"
 AP_CHANNEL="${AP_CHANNEL:-6}"
 ENABLE_CAPTURE="${ENABLE_CAPTURE:-yes}"
+ENABLE_MITM="${ENABLE_MITM:-no}"
+MITM_AUTO_START="${MITM_AUTO_START:-no}"
+MITM_DEFAULT_MODE="${MITM_DEFAULT_MODE:-web}"
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+SCRIPT_DIRECTORY="${SCRIPT_SOURCE%/*}"
+[[ "$SCRIPT_DIRECTORY" != "$SCRIPT_SOURCE" ]] || SCRIPT_DIRECTORY="."
+SCRIPT_DIRECTORY="$(cd -- "$SCRIPT_DIRECTORY" && pwd -P)"
 
 MGMT_ADDRESS="192.168.50.1/24"
 MGMT_IP="192.168.50.1"
@@ -37,7 +45,20 @@ CAPTURE_HELPER="/usr/local/sbin/eth1-capture-start.sh"
 PCAP_SIZE_MB="200"
 PCAP_FILE_COUNT="10"
 
+MITM_ASSET_DIRECTORY="$SCRIPT_DIRECTORY/mitm"
+MITM_CONFIG_FILE="/etc/default/zero2w-mitm"
+MITM_SERVICE_FILE="/etc/systemd/system/zero2w-mitm.service"
+MITM_SERVICE_USER="zero2w-mitm"
+MITM_SERVICE_GROUP="zero2w-mitm"
+MITM_STATE_DIRECTORY="/var/lib/zero2w-mitm"
+MITM_FLOW_DIRECTORY="/var/log/mitmproxy"
+MITM_MODE_FILE="/etc/zero2w-mitm/mode"
+MITM_INSTALL_DIRECTORY="/opt/zero2w-mitm"
+MITM_MANAGED_BIN_DIRECTORY="$MITM_INSTALL_DIRECTORY/bin"
+MITM_DOWNLOAD_INDEX="https://downloads.mitmproxy.org/list"
+
 CAPTURE_STATUS="disabled"
+MITM_STATUS="not installed"
 
 info() {
     printf '[INFO] %s\n' "$*"
@@ -77,11 +98,17 @@ Offline behavior:
   package repositories are reachable, the script attempts to install tcpdump.
   If that install attempt fails, packet capture is skipped and router setup
   continues.
+  When ENABLE_MITM=yes, the script also attempts to download the latest official
+  mitmproxy standalone build available for the detected Linux CPU architecture.
+  A failed or unavailable download leaves routing functional and MITM disabled.
 
 Environment overrides:
   WIFI_COUNTRY=US       Wi-Fi regulatory country used when supported.
   AP_CHANNEL=6          2.4 GHz access point channel.
   ENABLE_CAPTURE=yes    Set to "no" to skip the optional eth1 tcpdump service.
+  ENABLE_MITM=no        Set to "yes" to install the optional MITM subsystem.
+  MITM_AUTO_START=no    Set to "yes" to activate MITM after installation.
+  MITM_DEFAULT_MODE=web Initial mode for MITM_AUTO_START: web or tcp.
 
 Created or updated NetworkManager profiles:
   WAN-ETH0   Bound to eth0, IPv4 DHCP, default route allowed, route metric 100.
@@ -92,6 +119,7 @@ Created or updated files:
   /root/pi-router-wifi.txt
   /etc/systemd/system/eth1-capture.service, only when tcpdump is available and capture is enabled.
   /var/log/pcap, only when packet capture is configured.
+  /usr/local/sbin/zero2w-mitm and supporting files, only when ENABLE_MITM=yes.
 
 Default Wi-Fi credentials:
   The SSID is generated from the last three bytes of the wlan0 MAC address, for
@@ -199,6 +227,25 @@ normalize_enable_capture() {
         no|NO|false|FALSE|0) ENABLE_CAPTURE="no" ;;
         *) fail "ENABLE_CAPTURE must be yes or no." ;;
     esac
+}
+
+normalize_mitm_options() {
+    case "$ENABLE_MITM" in
+        yes|YES|true|TRUE|1) ENABLE_MITM="yes" ;;
+        no|NO|false|FALSE|0) ENABLE_MITM="no" ;;
+        *) fail "ENABLE_MITM must be yes or no." ;;
+    esac
+
+    case "$MITM_AUTO_START" in
+        yes|YES|true|TRUE|1) MITM_AUTO_START="yes" ;;
+        no|NO|false|FALSE|0) MITM_AUTO_START="no" ;;
+        *) fail "MITM_AUTO_START must be yes or no." ;;
+    esac
+
+    [[ "$MITM_DEFAULT_MODE" == "web" || "$MITM_DEFAULT_MODE" == "tcp" ]] || fail "MITM_DEFAULT_MODE must be web or tcp."
+    if [[ "$MITM_AUTO_START" == "yes" && "$ENABLE_MITM" != "yes" ]]; then
+        fail "MITM_AUTO_START=yes requires ENABLE_MITM=yes."
+    fi
 }
 
 validate_wifi_country_and_channel() {
@@ -626,6 +673,351 @@ configure_capture_service() {
     fi
 }
 
+ensure_curl_for_mitmproxy() {
+    if command -v curl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "curl is unavailable and apt-get cannot install it; automatic mitmproxy download will be skipped."
+        return 1
+    fi
+
+    info "curl is required to download mitmproxy; attempting to install curl and CA certificates."
+    if ! apt-get \
+        -o Acquire::Retries=0 \
+        -o Acquire::http::Timeout=10 \
+        -o Acquire::https::Timeout=10 \
+        update; then
+        warn "apt-get update failed while preparing the mitmproxy download."
+        return 1
+    fi
+    if ! apt-get \
+        -o Acquire::Retries=0 \
+        -o Acquire::http::Timeout=10 \
+        -o Acquire::https::Timeout=10 \
+        install -y curl ca-certificates; then
+        warn "Could not install curl and CA certificates; automatic mitmproxy download will be skipped."
+        return 1
+    fi
+
+    command -v curl >/dev/null 2>&1
+}
+
+mitmproxy_download_architecture() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf 'x86_64\n' ;;
+        aarch64|arm64) printf 'aarch64\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+update_mitmdump_config_path() {
+    local managed_path="$1"
+    local configured_path=""
+    local temporary_file=""
+
+    configured_path="$(read_saved_value "MITM_MITMDUMP_BIN" "$MITM_CONFIG_FILE" || true)"
+    if [[ -n "$configured_path" && "$configured_path" != "mitmdump" && "$configured_path" != "$MITM_MANAGED_BIN_DIRECTORY/mitmdump" ]]; then
+        warn "Preserving custom MITM_MITMDUMP_BIN=$configured_path instead of selecting the managed binary."
+        return 0
+    fi
+
+    temporary_file="${MITM_CONFIG_FILE}.$$"
+    awk -F= -v managed_path="$managed_path" '
+        BEGIN { updated=0 }
+        $1 == "MITM_MITMDUMP_BIN" { print "MITM_MITMDUMP_BIN=" managed_path; updated=1; next }
+        { print }
+        END { if (!updated) print "MITM_MITMDUMP_BIN=" managed_path }
+    ' "$MITM_CONFIG_FILE" | tee "$temporary_file" >/dev/null
+    chown root:root "$temporary_file"
+    chmod 644 "$temporary_file"
+    mv "$temporary_file" "$MITM_CONFIG_FILE"
+}
+
+install_latest_mitmproxy_if_online() {
+    local architecture=""
+    local version=""
+    local selected_version=""
+    local selected_url=""
+    local installed_release=""
+    local temporary_directory=""
+    local archive_file=""
+    local extract_directory=""
+    local staging_directory=""
+    local backup_directory=""
+    local candidate=""
+    local binary_name=""
+    local installed_count=0
+    local required_command=""
+    local versions=()
+
+    if [[ -z "$(ip -4 route show default 2>/dev/null | head -n 1)" ]]; then
+        warn "No IPv4 default route is available; automatic mitmproxy download was skipped."
+        return 1
+    fi
+
+    for required_command in uname tar sort mktemp grep sed; do
+        if ! command -v "$required_command" >/dev/null 2>&1; then
+            warn "Automatic mitmproxy installation requires '$required_command'."
+            return 1
+        fi
+    done
+
+    architecture="$(mitmproxy_download_architecture 2>/dev/null || true)"
+    if [[ -z "$architecture" ]]; then
+        warn "No official automatic mitmproxy installer mapping exists for Linux architecture $(uname -m)."
+        return 1
+    fi
+
+    ensure_curl_for_mitmproxy || return 1
+    temporary_directory="$(mktemp -d /tmp/zero2w-mitm.XXXXXX)"
+    archive_file="$temporary_directory/mitmproxy.tar.gz"
+    extract_directory="$temporary_directory/extracted"
+    mkdir -p "$extract_directory"
+
+    info "Checking the official mitmproxy download index for Linux $architecture."
+    if ! curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 1 --connect-timeout 10 --max-time 30 \
+        "$MITM_DOWNLOAD_INDEX" -o "$temporary_directory/download-index.xml"; then
+        warn "The official mitmproxy download index is unreachable; automatic installation was skipped."
+        rm -rf "$temporary_directory"
+        return 1
+    fi
+
+    mapfile -t versions < <(
+        grep -o '<Prefix>[^<]*/</Prefix>' "$temporary_directory/download-index.xml" \
+            | sed -E 's#</?Prefix>##g; s#/$##' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -Vr
+    )
+
+    for version in "${versions[@]}"; do
+        selected_url="https://downloads.mitmproxy.org/$version/mitmproxy-$version-linux-$architecture.tar.gz"
+        if curl -fsSI --proto '=https' --tlsv1.2 \
+            --retry 1 --connect-timeout 10 --max-time 20 "$selected_url" >/dev/null; then
+            selected_version="$version"
+            break
+        fi
+    done
+
+    if [[ -z "$selected_version" ]]; then
+        warn "No official mitmproxy standalone build was found for Linux $architecture."
+        rm -rf "$temporary_directory"
+        return 1
+    fi
+
+    installed_release="$(head -n 1 "$MITM_INSTALL_DIRECTORY/RELEASE" 2>/dev/null || true)"
+    if [[ "$installed_release" == "$selected_version $architecture" && -x "$MITM_MANAGED_BIN_DIRECTORY/mitmdump" ]]; then
+        ok "Latest mitmproxy $selected_version for Linux $architecture is already installed."
+        rm -rf "$temporary_directory"
+        update_mitmdump_config_path "$MITM_MANAGED_BIN_DIRECTORY/mitmdump"
+        return 0
+    fi
+
+    info "Downloading mitmproxy $selected_version for Linux $architecture."
+    if ! curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --retry 1 --connect-timeout 10 --max-time 900 \
+        "$selected_url" -o "$archive_file"; then
+        warn "mitmproxy download failed; any existing installation was preserved."
+        rm -rf "$temporary_directory"
+        return 1
+    fi
+
+    if ! tar -tzf "$archive_file" >/dev/null 2>&1; then
+        warn "The downloaded mitmproxy archive is invalid."
+        rm -rf "$temporary_directory"
+        return 1
+    fi
+    if tar -tzf "$archive_file" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+        warn "The downloaded mitmproxy archive contains unsafe paths."
+        rm -rf "$temporary_directory"
+        return 1
+    fi
+    if ! tar -xzf "$archive_file" -C "$extract_directory"; then
+        warn "Could not extract the downloaded mitmproxy archive."
+        rm -rf "$temporary_directory"
+        return 1
+    fi
+
+    install -d -o root -g root -m 0755 "$MITM_INSTALL_DIRECTORY"
+    staging_directory="$MITM_INSTALL_DIRECTORY/bin.new.$$"
+    backup_directory="$MITM_INSTALL_DIRECTORY/bin.previous.$$"
+    rm -rf "$staging_directory" "$backup_directory"
+    install -d -o root -g root -m 0755 "$staging_directory"
+
+    for candidate in "$extract_directory"/mitm* "$extract_directory"/*/mitm*; do
+        [[ -f "$candidate" && -x "$candidate" ]] || continue
+        binary_name="${candidate##*/}"
+        case "$binary_name" in
+            mitmdump|mitmproxy|mitmweb)
+                install -o root -g root -m 0755 "$candidate" "$staging_directory/$binary_name"
+                installed_count=$((installed_count + 1))
+                ;;
+        esac
+    done
+
+    if [[ "$installed_count" -eq 0 || ! -x "$staging_directory/mitmdump" ]]; then
+        warn "The archive did not contain an executable mitmdump binary."
+        rm -rf "$temporary_directory" "$staging_directory"
+        return 1
+    fi
+    if ! "$staging_directory/mitmdump" --version >/dev/null 2>&1; then
+        warn "The downloaded mitmdump binary cannot run on this system."
+        rm -rf "$temporary_directory" "$staging_directory"
+        return 1
+    fi
+
+    if [[ -e "$MITM_MANAGED_BIN_DIRECTORY" ]]; then
+        mv "$MITM_MANAGED_BIN_DIRECTORY" "$backup_directory"
+    fi
+    if ! mv "$staging_directory" "$MITM_MANAGED_BIN_DIRECTORY"; then
+        [[ ! -e "$backup_directory" ]] || mv "$backup_directory" "$MITM_MANAGED_BIN_DIRECTORY"
+        rm -rf "$temporary_directory" "$staging_directory"
+        warn "Could not activate the downloaded mitmproxy release."
+        return 1
+    fi
+    rm -rf "$backup_directory"
+
+    printf '%s %s\n' "$selected_version" "$architecture" | tee "$MITM_INSTALL_DIRECTORY/RELEASE" >/dev/null
+    chown root:root "$MITM_INSTALL_DIRECTORY/RELEASE"
+    chmod 644 "$MITM_INSTALL_DIRECTORY/RELEASE"
+    update_mitmdump_config_path "$MITM_MANAGED_BIN_DIRECTORY/mitmdump"
+    rm -rf "$temporary_directory"
+
+    ok "Installed mitmproxy $selected_version for Linux $architecture."
+    return 0
+}
+
+configure_mitm_subsystem() {
+    local required_asset=""
+    local required_command=""
+    local nologin_path=""
+    local temporary_mode_file=""
+    local mitmdump_path=""
+    local configured_mitmdump=""
+    local required_assets=(
+        zero2w-mitm
+        zero2w-mitm-common
+        zero2w-mitm-firewall
+        zero2w-mitm-check
+        zero2w-mitm-run
+        zero2w-mitm.service
+        zero2w-mitm.conf
+    )
+
+    if [[ "$ENABLE_MITM" == "no" ]]; then
+        MITM_STATUS="not installed by this run"
+        info "Transparent MITM installation is disabled by ENABLE_MITM=no."
+        return 0
+    fi
+
+    for required_command in install id useradd getent chown iptables sysctl; do
+        if ! command -v "$required_command" >/dev/null 2>&1; then
+            MITM_STATUS="skipped because $required_command is unavailable"
+            warn "Optional MITM setup requires '$required_command'; MITM installation was skipped."
+            return 0
+        fi
+    done
+
+    for required_asset in "${required_assets[@]}"; do
+        if [[ ! -f "$MITM_ASSET_DIRECTORY/$required_asset" ]]; then
+            MITM_STATUS="skipped because installation assets are missing"
+            warn "Missing MITM asset: $MITM_ASSET_DIRECTORY/$required_asset. Keep the mitm directory beside configure-pi-router.sh."
+            return 0
+        fi
+    done
+
+    if [[ -x /usr/local/libexec/zero2w-mitm-firewall ]]; then
+        /usr/local/libexec/zero2w-mitm-firewall remove >/dev/null 2>&1 || true
+    fi
+    if service_exists "zero2w-mitm.service"; then
+        systemctl disable --now zero2w-mitm.service >/dev/null 2>&1 || true
+    fi
+
+    nologin_path="$(command -v nologin 2>/dev/null || true)"
+    [[ -n "$nologin_path" ]] || nologin_path="/usr/sbin/nologin"
+
+    if ! id -u "$MITM_SERVICE_USER" >/dev/null 2>&1; then
+        if getent group "$MITM_SERVICE_GROUP" >/dev/null 2>&1; then
+            useradd --system --gid "$MITM_SERVICE_GROUP" --home-dir "$MITM_STATE_DIRECTORY" \
+                --create-home --shell "$nologin_path" "$MITM_SERVICE_USER"
+        else
+            useradd --system --user-group --home-dir "$MITM_STATE_DIRECTORY" \
+                --create-home --shell "$nologin_path" "$MITM_SERVICE_USER"
+        fi
+        ok "Created the $MITM_SERVICE_USER system account."
+    fi
+
+    if [[ "$(id -gn "$MITM_SERVICE_USER")" != "$MITM_SERVICE_GROUP" ]]; then
+        MITM_STATUS="skipped because the service account has an unexpected primary group"
+        warn "User $MITM_SERVICE_USER must have primary group $MITM_SERVICE_GROUP; MITM installation was skipped."
+        return 0
+    fi
+
+    install -d -o root -g root -m 0755 /usr/local/sbin /usr/local/libexec /etc/default /etc/zero2w-mitm
+    install -d -o "$MITM_SERVICE_USER" -g "$MITM_SERVICE_GROUP" -m 0750 \
+        "$MITM_STATE_DIRECTORY" "$MITM_STATE_DIRECTORY/.mitmproxy" "$MITM_FLOW_DIRECTORY"
+
+    install -o root -g root -m 0755 "$MITM_ASSET_DIRECTORY/zero2w-mitm" /usr/local/sbin/zero2w-mitm
+    install -o root -g root -m 0644 "$MITM_ASSET_DIRECTORY/zero2w-mitm-common" /usr/local/libexec/zero2w-mitm-common
+    install -o root -g root -m 0755 "$MITM_ASSET_DIRECTORY/zero2w-mitm-firewall" /usr/local/libexec/zero2w-mitm-firewall
+    install -o root -g root -m 0755 "$MITM_ASSET_DIRECTORY/zero2w-mitm-check" /usr/local/libexec/zero2w-mitm-check
+    install -o root -g root -m 0755 "$MITM_ASSET_DIRECTORY/zero2w-mitm-run" /usr/local/libexec/zero2w-mitm-run
+    install -o root -g root -m 0644 "$MITM_ASSET_DIRECTORY/zero2w-mitm.service" "$MITM_SERVICE_FILE"
+
+    if [[ ! -f "$MITM_CONFIG_FILE" ]]; then
+        install -o root -g root -m 0644 "$MITM_ASSET_DIRECTORY/zero2w-mitm.conf" "$MITM_CONFIG_FILE"
+    else
+        chown root:root "$MITM_CONFIG_FILE"
+        chmod 644 "$MITM_CONFIG_FILE"
+        ok "Preserved existing MITM configuration in $MITM_CONFIG_FILE."
+    fi
+
+    if [[ ! -f "$MITM_MODE_FILE" ]]; then
+        temporary_mode_file="$MITM_MODE_FILE.$$"
+        printf '%s\n' "$MITM_DEFAULT_MODE" | tee "$temporary_mode_file" >/dev/null
+        chmod 644 "$temporary_mode_file"
+        chown root:root "$temporary_mode_file"
+        mv "$temporary_mode_file" "$MITM_MODE_FILE"
+    fi
+
+    install_latest_mitmproxy_if_online || true
+    if [[ -x "$MITM_MANAGED_BIN_DIRECTORY/mitmdump" ]]; then
+        update_mitmdump_config_path "$MITM_MANAGED_BIN_DIRECTORY/mitmdump"
+    fi
+
+    systemctl daemon-reload
+
+    configured_mitmdump="$(read_saved_value "MITM_MITMDUMP_BIN" "$MITM_CONFIG_FILE" || true)"
+    [[ -n "$configured_mitmdump" ]] || configured_mitmdump="mitmdump"
+    mitmdump_path="$(command -v "$configured_mitmdump" 2>/dev/null || true)"
+    if [[ -z "$mitmdump_path" ]]; then
+        MITM_STATUS="installed and disabled; mitmdump is unavailable"
+        warn "MITM controls were installed, but mitmdump is unavailable. Install mitmproxy before enabling interception."
+        systemctl disable zero2w-mitm.service >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    if [[ "$MITM_AUTO_START" == "yes" ]]; then
+        printf '%s\n' "$MITM_DEFAULT_MODE" | tee "$MITM_MODE_FILE" >/dev/null
+        chmod 644 "$MITM_MODE_FILE"
+        chown root:root "$MITM_MODE_FILE"
+        if /usr/local/sbin/zero2w-mitm enable "$MITM_DEFAULT_MODE" >/dev/null && systemctl enable zero2w-mitm.service >/dev/null; then
+            MITM_STATUS="active in $MITM_DEFAULT_MODE mode and enabled at boot"
+            ok "Transparent MITM started in $MITM_DEFAULT_MODE mode."
+        else
+            /usr/local/sbin/zero2w-mitm disable >/dev/null 2>&1 || true
+            MITM_STATUS="installed but automatic activation failed"
+            warn "MITM was installed but could not be activated; interception remains disabled."
+        fi
+    else
+        /usr/local/sbin/zero2w-mitm disable >/dev/null 2>&1 || true
+        MITM_STATUS="installed and disabled"
+        ok "Transparent MITM controls installed; interception remains disabled."
+    fi
+}
+
 default_route_summary() {
     ip -4 route show default 2>/dev/null | head -n 1
 }
@@ -687,6 +1079,11 @@ Packet capture:
   Status: $CAPTURE_STATUS
   Directory: $PCAP_DIRECTORY
 
+Transparent MITM:
+  Status: $MITM_STATUS
+  Control: /usr/local/sbin/zero2w-mitm
+  Flow directory: $MITM_FLOW_DIRECTORY
+
 Credentials file:
   $CREDENTIALS_FILE
 EOF_SUMMARY
@@ -709,6 +1106,7 @@ main() {
 
     require_root
     normalize_enable_capture
+    normalize_mitm_options
     validate_wifi_country_and_channel
     require_base_commands
 
@@ -738,6 +1136,7 @@ main() {
     ensure_wifi_profile "$ssid" "$wifi_password"
     remove_legacy_interface_up_service
     configure_capture_service
+    configure_mitm_subsystem
     check_wan_overlap
 
     print_summary "$ssid" "$wifi_password"
