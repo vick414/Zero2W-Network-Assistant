@@ -1,0 +1,27 @@
+[Unit]
+Description=Managed rotating packet capture on the device LAN
+BindsTo=sys-subsystem-net-devices-eth1.device
+After=sys-subsystem-net-devices-eth1.device NetworkManager.service
+ConditionPathExists=/etc/default/zero2w-capture
+
+[Service]
+Type=simple
+User=zero2w-capture
+Group=zero2w-capture
+UMask=0027
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStartPre=+/usr/local/libexec/zero2w-capture-check
+ExecStart=/usr/local/libexec/zero2w-capture-run
+ExecStopPost=+/usr/local/libexec/zero2w-capture-prune enforce
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=full
+ReadWritePaths=/var/log/pcap
+
+[Install]
+WantedBy=multi-user.target sys-subsystem-net-devices-eth1.device

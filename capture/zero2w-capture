@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Operator command for the Zero2W packet capture subsystem.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_CAPTURE_COMMON:-/usr/local/libexec/zero2w-capture-common}"
+PRUNE_HELPER="${ZERO2W_CAPTURE_PRUNE:-/usr/local/libexec/zero2w-capture-prune}"
+SERVICE_NAME="${ZERO2W_CAPTURE_SERVICE:-eth1-capture.service}"
+
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+usage() {
+    cat <<'EOF_HELP'
+Usage:
+  sudo zero2w-capture enable
+  sudo zero2w-capture disable
+  sudo zero2w-capture restart
+  sudo zero2w-capture rotate
+  sudo zero2w-capture status
+
+The rotate command closes the current capture and starts a new timestamped file.
+EOF_HELP
+}
+
+latest_capture_file() {
+    local file=""
+    local latest=""
+
+    for file in "$CAPTURE_DIRECTORY/$CAPTURE_FILE_PREFIX"-*.pcap*; do
+        [[ -f "$file" ]] || continue
+        if [[ -z "$latest" || "$file" -nt "$latest" ]]; then
+            latest="$file"
+        fi
+    done
+    printf '%s\n' "$latest"
+}
+
+show_status() {
+    local service_state="inactive"
+    local boot_state="disabled"
+    local carrier="unknown"
+    local operstate="unknown"
+    local rx_packets="unknown"
+    local main_pid="none"
+    local newest_file="none"
+    local file_count=0
+    local directory_size="unavailable"
+    local tcpdump_path=""
+    local tcpdump_version="unavailable"
+
+    service_state="$($SYSTEMCTL_PATH is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    boot_state="$($SYSTEMCTL_PATH is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+    main_pid="$($SYSTEMCTL_PATH show -p MainPID --value "$SERVICE_NAME" 2>/dev/null || true)"
+    [[ -n "$main_pid" && "$main_pid" != "0" ]] || main_pid="none"
+
+    [[ ! -r "/sys/class/net/$CAPTURE_INTERFACE/carrier" ]] || carrier="$(<"/sys/class/net/$CAPTURE_INTERFACE/carrier")"
+    [[ ! -r "/sys/class/net/$CAPTURE_INTERFACE/operstate" ]] || operstate="$(<"/sys/class/net/$CAPTURE_INTERFACE/operstate")"
+    [[ ! -r "/sys/class/net/$CAPTURE_INTERFACE/statistics/rx_packets" ]] || rx_packets="$(<"/sys/class/net/$CAPTURE_INTERFACE/statistics/rx_packets")"
+
+    newest_file="$(latest_capture_file)"
+    [[ -n "$newest_file" ]] || newest_file="none"
+    if [[ -d "$CAPTURE_DIRECTORY" ]]; then
+        file_count="$(find "$CAPTURE_DIRECTORY" -maxdepth 1 -type f -name "$CAPTURE_FILE_PREFIX-*.pcap*" | wc -l | tr -d ' ')"
+        directory_size="$(du -sh "$CAPTURE_DIRECTORY" 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    tcpdump_path="$(capture_command_path "$CAPTURE_TCPDUMP_BIN" || true)"
+    if [[ -n "$tcpdump_path" ]]; then
+        tcpdump_version="$("$tcpdump_path" --version 2>/dev/null | head -n 1 || true)"
+    fi
+
+    cat <<EOF_STATUS
+Service state: ${service_state:-inactive}
+Start at boot: ${boot_state:-disabled}
+Interface: $CAPTURE_INTERFACE
+Link state: $operstate
+Carrier: $carrier
+RX packets: $rx_packets
+Main PID: $main_pid
+Capture directory: $CAPTURE_DIRECTORY
+Newest file: $newest_file
+Managed files: $file_count / $CAPTURE_MAX_FILES
+Directory size: ${directory_size:-unavailable}
+Rotation: ${CAPTURE_FILE_SIZE_MB} MB or ${CAPTURE_ROTATE_SECONDS} seconds
+tcpdump binary: ${tcpdump_path:-unavailable}
+tcpdump version: ${tcpdump_version:-unknown}
+EOF_STATUS
+}
+
+main() {
+    local action="${1:-status}"
+
+    capture_require_root || exit 1
+    capture_load_config
+    capture_validate_config || exit 1
+    SYSTEMCTL_PATH="$(capture_command_path "$CAPTURE_SYSTEMCTL_BIN")" || {
+        capture_fail "systemctl is required."
+        exit 1
+    }
+
+    case "$action" in
+        enable)
+            [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
+            capture_command_path "$CAPTURE_TCPDUMP_BIN" >/dev/null || {
+                capture_fail "tcpdump is unavailable."
+                exit 1
+            }
+            "$SYSTEMCTL_PATH" enable --now "$SERVICE_NAME"
+            "$SYSTEMCTL_PATH" is-active --quiet "$SERVICE_NAME" || {
+                capture_fail "$SERVICE_NAME did not remain active."
+                exit 1
+            }
+            capture_ok "Packet capture enabled."
+            show_status
+            ;;
+        disable)
+            [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
+            "$SYSTEMCTL_PATH" disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+            "$PRUNE_HELPER" enforce
+            capture_ok "Packet capture disabled."
+            ;;
+        restart|rotate)
+            [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
+            capture_command_path "$CAPTURE_TCPDUMP_BIN" >/dev/null || {
+                capture_fail "tcpdump is unavailable."
+                exit 1
+            }
+            "$SYSTEMCTL_PATH" restart "$SERVICE_NAME"
+            capture_ok "Packet capture restarted with a new timestamped file."
+            show_status
+            ;;
+        status)
+            [[ "$#" -eq 1 ]] || { usage >&2; exit 2; }
+            show_status
+            ;;
+        --help|-h|help)
+            usage
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

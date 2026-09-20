@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Run the rotating packet capture as the dedicated service account.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_CAPTURE_COMMON:-/usr/local/libexec/zero2w-capture-common}"
+PRUNE_HELPER="${ZERO2W_CAPTURE_PRUNE:-/usr/local/libexec/zero2w-capture-prune}"
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+main() {
+    local tcpdump_path=""
+    local filter_args=()
+    local args=()
+
+    capture_load_config
+    capture_validate_config
+    tcpdump_path="$(capture_command_path "$CAPTURE_TCPDUMP_BIN")" || {
+        capture_fail "tcpdump is unavailable."
+        exit 1
+    }
+    [[ -d "$CAPTURE_DIRECTORY" && -w "$CAPTURE_DIRECTORY" ]] || {
+        capture_fail "Capture directory is not writable: $CAPTURE_DIRECTORY"
+        exit 1
+    }
+
+    args=(
+        -i "$CAPTURE_INTERFACE"
+        -nn
+        -s 0
+        -U
+        -C "$CAPTURE_FILE_SIZE_MB"
+        -G "$CAPTURE_ROTATE_SECONDS"
+        -w "$CAPTURE_DIRECTORY/$CAPTURE_FILE_PREFIX-%Y%m%d-%H%M%S.pcap"
+        -z "$PRUNE_HELPER"
+    )
+
+    if [[ -n "$CAPTURE_FILTER" ]]; then
+        read -r -a filter_args <<< "$CAPTURE_FILTER"
+        args+=("${filter_args[@]}")
+    fi
+
+    capture_info "Starting capture on $CAPTURE_INTERFACE in $CAPTURE_DIRECTORY."
+    exec "$tcpdump_path" "${args[@]}"
+}
+
+main "$@"

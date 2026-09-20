@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Validate capture prerequisites and prepare eth1 before tcpdump starts.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_CAPTURE_COMMON:-/usr/local/libexec/zero2w-capture-common}"
+PRUNE_HELPER="${ZERO2W_CAPTURE_PRUNE:-/usr/local/libexec/zero2w-capture-prune}"
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+main() {
+    local ip_path=""
+    local service_user="zero2w-capture"
+    local service_group="zero2w-capture"
+
+    capture_load_config
+    capture_validate_config
+    capture_command_path "$CAPTURE_TCPDUMP_BIN" >/dev/null || {
+        capture_fail "tcpdump is unavailable."
+        exit 1
+    }
+    ip_path="$(capture_command_path "$CAPTURE_IP_BIN")" || {
+        capture_fail "ip is unavailable."
+        exit 1
+    }
+    if [[ "${ZERO2W_CAPTURE_TESTING:-no}" != "yes" && ! -d "/sys/class/net/$CAPTURE_INTERFACE" ]]; then
+        capture_fail "Capture interface '$CAPTURE_INTERFACE' does not exist."
+        exit 1
+    fi
+
+    install -d -o "$service_user" -g "$service_group" -m 0750 "$CAPTURE_DIRECTORY"
+    find "$CAPTURE_DIRECTORY" -maxdepth 1 -type f -name "$CAPTURE_FILE_PREFIX-*.pcap*" \
+        -exec chown "$service_user:$service_group" {} +
+    "$ip_path" link set dev "$CAPTURE_INTERFACE" up
+    "$PRUNE_HELPER" prepare
+}
+
+main "$@"

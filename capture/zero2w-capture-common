@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+
+capture_info() {
+    printf '[INFO] %s\n' "$*"
+}
+
+capture_ok() {
+    printf '[OK] %s\n' "$*"
+}
+
+capture_warn() {
+    printf '[WARNING] %s\n' "$*" >&2
+}
+
+capture_fail() {
+    printf '[ERROR] %s\n' "$*" >&2
+    return 1
+}
+
+capture_require_root() {
+    if [[ "${ZERO2W_CAPTURE_TESTING:-no}" != "yes" && "$EUID" -ne 0 ]]; then
+        capture_fail "Run this command as root."
+        return 1
+    fi
+}
+
+capture_command_path() {
+    command -v "$1" 2>/dev/null
+}
+
+capture_load_config() {
+    ZERO2W_CAPTURE_CONFIG_FILE="${ZERO2W_CAPTURE_CONFIG_FILE:-/etc/default/zero2w-capture}"
+
+    CAPTURE_INTERFACE="eth1"
+    CAPTURE_DIRECTORY="/var/log/pcap"
+    CAPTURE_FILE_PREFIX="eth1"
+    CAPTURE_FILE_SIZE_MB="200"
+    CAPTURE_MAX_FILES="10"
+    CAPTURE_ROTATE_SECONDS="86400"
+    CAPTURE_FILTER=""
+    CAPTURE_TCPDUMP_BIN="tcpdump"
+    CAPTURE_SYSTEMCTL_BIN="systemctl"
+    CAPTURE_IP_BIN="ip"
+
+    if [[ -r "$ZERO2W_CAPTURE_CONFIG_FILE" ]]; then
+        # The configuration is a root-owned /etc/default shell file.
+        # shellcheck disable=SC1090
+        source "$ZERO2W_CAPTURE_CONFIG_FILE"
+    fi
+}
+
+capture_validate_config() {
+    [[ "$CAPTURE_INTERFACE" =~ ^[[:alnum:]_.:-]{1,15}$ ]] || {
+        capture_fail "Invalid CAPTURE_INTERFACE: $CAPTURE_INTERFACE"
+        return 1
+    }
+    [[ "$CAPTURE_FILE_PREFIX" =~ ^[[:alnum:]_.-]+$ ]] || {
+        capture_fail "Invalid CAPTURE_FILE_PREFIX: $CAPTURE_FILE_PREFIX"
+        return 1
+    }
+    if [[ "${ZERO2W_CAPTURE_TESTING:-no}" == "yes" ]]; then
+        [[ "$CAPTURE_DIRECTORY" == /* && "$CAPTURE_DIRECTORY" != *$'\n'* ]] || {
+            capture_fail "CAPTURE_DIRECTORY must be an absolute path without newlines."
+            return 1
+        }
+    else
+        [[ "$CAPTURE_DIRECTORY" =~ ^/var/log/[[:alnum:]_][[:alnum:]_.-]*(/[[:alnum:]_][[:alnum:]_.-]*)*$ ]] || {
+            capture_fail "CAPTURE_DIRECTORY must be a path below /var/log using simple path components."
+            return 1
+        }
+    fi
+    [[ "$CAPTURE_FILE_SIZE_MB" =~ ^[0-9]+$ ]] && (( CAPTURE_FILE_SIZE_MB >= 1 )) || {
+        capture_fail "CAPTURE_FILE_SIZE_MB must be a positive integer."
+        return 1
+    }
+    [[ "$CAPTURE_MAX_FILES" =~ ^[0-9]+$ ]] && (( CAPTURE_MAX_FILES >= 1 )) || {
+        capture_fail "CAPTURE_MAX_FILES must be a positive integer."
+        return 1
+    }
+    [[ "$CAPTURE_ROTATE_SECONDS" =~ ^[0-9]+$ ]] && (( CAPTURE_ROTATE_SECONDS >= 60 )) || {
+        capture_fail "CAPTURE_ROTATE_SECONDS must be at least 60."
+        return 1
+    }
+}

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Enforce the global capture file retention limit without touching other files.
+
+set -Eeuo pipefail
+
+COMMON_FILE="${ZERO2W_CAPTURE_COMMON:-/usr/local/libexec/zero2w-capture-common}"
+[[ -r "$COMMON_FILE" ]] || {
+    printf '[ERROR] Missing common library: %s\n' "$COMMON_FILE" >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+source "$COMMON_FILE"
+
+file_mtime() {
+    local file="$1"
+    stat -c '%Y' "$file" 2>/dev/null || stat -f '%m' "$file" 2>/dev/null
+}
+
+acquire_lock() {
+    local attempt=0
+    LOCK_DIRECTORY="$CAPTURE_DIRECTORY/.zero2w-capture-prune.lock"
+
+    while ! mkdir "$LOCK_DIRECTORY" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        if (( attempt >= 50 )); then
+            capture_fail "Timed out waiting for the capture retention lock."
+            return 1
+        fi
+        sleep 0.1
+    done
+    trap 'rmdir "$LOCK_DIRECTORY" 2>/dev/null || true' EXIT
+}
+
+prune_files() {
+    local keep_count="$1"
+    local entry=""
+    local file=""
+    local remove_count=0
+    local index=0
+    local entries=()
+
+    while IFS= read -r entry; do
+        entries[${#entries[@]}]="$entry"
+    done < <(
+        for file in "$CAPTURE_DIRECTORY/$CAPTURE_FILE_PREFIX"-*.pcap*; do
+            [[ -f "$file" ]] || continue
+            printf '%s\t%s\n' "$(file_mtime "$file")" "$file"
+        done | sort -n
+    )
+
+    if (( ${#entries[@]} <= keep_count )); then
+        return 0
+    fi
+
+    remove_count=$(( ${#entries[@]} - keep_count ))
+    for (( index=0; index<remove_count; index++ )); do
+        entry="${entries[$index]}"
+        file="${entry#*$'\t'}"
+        [[ "$file" == "$CAPTURE_DIRECTORY/$CAPTURE_FILE_PREFIX"-*.pcap* ]] || continue
+        rm -f -- "$file"
+    done
+}
+
+main() {
+    local action="${1:-enforce}"
+    local keep_count=0
+
+    capture_load_config
+    capture_validate_config
+    mkdir -p "$CAPTURE_DIRECTORY"
+    acquire_lock
+
+    case "$action" in
+        prepare)
+            keep_count=$(( CAPTURE_MAX_FILES - 1 ))
+            ;;
+        enforce|/*)
+            # tcpdump passes the closed savefile path after a -z rotation.
+            keep_count="$CAPTURE_MAX_FILES"
+            ;;
+        *)
+            capture_fail "Unsupported retention action: $action"
+            exit 2
+            ;;
+    esac
+
+    prune_files "$keep_count"
+}
+
+main "$@"

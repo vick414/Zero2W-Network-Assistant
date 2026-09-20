@@ -17,6 +17,7 @@ AP_PROFILE="MGMT-WIFI"
 WIFI_COUNTRY="${WIFI_COUNTRY:-US}"
 AP_CHANNEL="${AP_CHANNEL:-6}"
 ENABLE_CAPTURE="${ENABLE_CAPTURE:-yes}"
+CAPTURE_AUTO_START="${CAPTURE_AUTO_START:-yes}"
 ENABLE_MITM="${ENABLE_MITM:-no}"
 MITM_AUTO_START="${MITM_AUTO_START:-no}"
 MITM_DEFAULT_MODE="${MITM_DEFAULT_MODE:-web}"
@@ -42,8 +43,10 @@ LEGACY_INTERFACE_UP_SERVICE="/etc/systemd/system/pi-router-interfaces-up.service
 PCAP_DIRECTORY="/var/log/pcap"
 CAPTURE_SERVICE="/etc/systemd/system/eth1-capture.service"
 CAPTURE_HELPER="/usr/local/sbin/eth1-capture-start.sh"
-PCAP_SIZE_MB="200"
-PCAP_FILE_COUNT="10"
+CAPTURE_ASSET_DIRECTORY="$SCRIPT_DIRECTORY/capture"
+CAPTURE_CONFIG_FILE="/etc/default/zero2w-capture"
+CAPTURE_SERVICE_USER="zero2w-capture"
+CAPTURE_SERVICE_GROUP="zero2w-capture"
 
 MITM_ASSET_DIRECTORY="$SCRIPT_DIRECTORY/mitm"
 MITM_CONFIG_FILE="/etc/default/zero2w-mitm"
@@ -106,6 +109,8 @@ Environment overrides:
   WIFI_COUNTRY=US       Wi-Fi regulatory country used when supported.
   AP_CHANNEL=6          2.4 GHz access point channel.
   ENABLE_CAPTURE=yes    Set to "no" to skip the optional eth1 tcpdump service.
+  CAPTURE_AUTO_START=yes
+                        Set to "no" to install capture controls without starting them.
   ENABLE_MITM=no        Set to "yes" to install the optional MITM subsystem.
   MITM_AUTO_START=no    Set to "yes" to activate MITM after installation.
   MITM_DEFAULT_MODE=web Initial mode for MITM_AUTO_START: web or tcp.
@@ -117,7 +122,8 @@ Created or updated NetworkManager profiles:
 
 Created or updated files:
   /root/pi-router-wifi.txt
-  /etc/systemd/system/eth1-capture.service, only when tcpdump is available and capture is enabled.
+  /etc/systemd/system/eth1-capture.service and /usr/local/sbin/zero2w-capture,
+  only when packet capture is enabled.
   /var/log/pcap, only when packet capture is configured.
   /usr/local/sbin/zero2w-mitm and supporting files, only when ENABLE_MITM=yes.
 
@@ -226,6 +232,12 @@ normalize_enable_capture() {
         yes|YES|true|TRUE|1) ENABLE_CAPTURE="yes" ;;
         no|NO|false|FALSE|0) ENABLE_CAPTURE="no" ;;
         *) fail "ENABLE_CAPTURE must be yes or no." ;;
+    esac
+
+    case "$CAPTURE_AUTO_START" in
+        yes|YES|true|TRUE|1) CAPTURE_AUTO_START="yes" ;;
+        no|NO|false|FALSE|0) CAPTURE_AUTO_START="no" ;;
+        *) fail "CAPTURE_AUTO_START must be yes or no." ;;
     esac
 }
 
@@ -561,12 +573,12 @@ install_tcpdump_if_online() {
     fi
 
     if ! command -v apt-get >/dev/null 2>&1; then
-        warn "tcpdump is not installed and apt-get is unavailable. Packet capture service will be skipped."
+        warn "tcpdump is not installed and apt-get is unavailable. Automatic capture will remain disabled."
         return 1
     fi
 
     if ! ip -4 route show default >/dev/null 2>&1 || [[ -z "$(ip -4 route show default 2>/dev/null | head -n 1)" ]]; then
-        warn "tcpdump is not installed and no IPv4 default route is currently available. Packet capture service will be skipped."
+        warn "tcpdump is not installed and no IPv4 default route is currently available. Automatic capture will remain disabled."
         return 1
     fi
 
@@ -576,7 +588,7 @@ install_tcpdump_if_online() {
         -o Acquire::http::Timeout=10 \
         -o Acquire::https::Timeout=10 \
         update; then
-        warn "apt-get update failed. Internet or package repositories are unavailable. Packet capture service will be skipped."
+        warn "apt-get update failed. Internet or package repositories are unavailable. Automatic capture will remain disabled."
         return 1
     fi
 
@@ -585,12 +597,12 @@ install_tcpdump_if_online() {
         -o Acquire::http::Timeout=10 \
         -o Acquire::https::Timeout=10 \
         install -y tcpdump; then
-        warn "apt-get install tcpdump failed. Packet capture service will be skipped."
+        warn "apt-get install tcpdump failed. Automatic capture will remain disabled."
         return 1
     fi
 
     command -v tcpdump >/dev/null 2>&1 || {
-        warn "tcpdump installation completed but tcpdump is still not available in PATH. Packet capture service will be skipped."
+        warn "tcpdump installation completed but tcpdump is still not available in PATH. Automatic capture will remain disabled."
         return 1
     }
 
@@ -599,11 +611,19 @@ install_tcpdump_if_online() {
 }
 
 configure_capture_service() {
-    local bash_path=""
-    local tcpdump_path=""
+    local required_asset=""
+    local required_command=""
+    local nologin_path=""
     local timestamp=""
-    local temporary_helper=""
-    local temporary_service=""
+    local required_assets=(
+        zero2w-capture
+        zero2w-capture-common
+        zero2w-capture-prune
+        zero2w-capture-check
+        zero2w-capture-run
+        eth1-capture.service
+        zero2w-capture.conf
+    )
 
     if [[ "$ENABLE_CAPTURE" == "no" ]]; then
         CAPTURE_STATUS="disabled"
@@ -614,62 +634,105 @@ configure_capture_service() {
         return 0
     fi
 
-    if ! command -v tcpdump >/dev/null 2>&1 && ! install_tcpdump_if_online; then
-        CAPTURE_STATUS="skipped because tcpdump is unavailable"
-        warn "tcpdump is unavailable. Packet capture service was skipped."
-        return 0
+    for required_command in install id useradd getent chown find stat sort du wc; do
+        if ! command -v "$required_command" >/dev/null 2>&1; then
+            CAPTURE_STATUS="skipped because $required_command is unavailable"
+            warn "Optional packet capture setup requires '$required_command'; capture installation was skipped."
+            return 0
+        fi
+    done
+
+    for required_asset in "${required_assets[@]}"; do
+        if [[ ! -f "$CAPTURE_ASSET_DIRECTORY/$required_asset" ]]; then
+            CAPTURE_STATUS="skipped because installation assets are missing"
+            warn "Missing capture asset: $CAPTURE_ASSET_DIRECTORY/$required_asset. Keep the capture directory beside configure-pi-router.sh."
+            return 0
+        fi
+    done
+
+    if service_exists "eth1-capture.service"; then
+        systemctl disable --now eth1-capture.service >/dev/null 2>&1 || true
     fi
 
-    bash_path="$(command -v bash)"
-    tcpdump_path="$(command -v tcpdump)"
-    mkdir -p "/usr/local/sbin"
-    mkdir -p "$PCAP_DIRECTORY"
-    chmod 700 "$PCAP_DIRECTORY"
-
-    temporary_helper="${CAPTURE_HELPER}.$$"
-    {
-        printf '#!%s\n' "$bash_path"
-        printf 'set -Eeuo pipefail\n'
-        printf '\n'
-        printf 'exec %q -i %q -nn -s 0 -U -C %q -W %q -Z root -w %q/eth1-$(date +%%Y%%m%%d-%%H%%M%%S).pcap\n' "$tcpdump_path" "$LAN_IF" "$PCAP_SIZE_MB" "$PCAP_FILE_COUNT" "$PCAP_DIRECTORY"
-    } | tee "$temporary_helper" >/dev/null
-    chmod 755 "$temporary_helper"
-    mv "$temporary_helper" "$CAPTURE_HELPER"
-
-    if [[ -f "$CAPTURE_SERVICE" ]]; then
+    if [[ -f "$CAPTURE_SERVICE" ]] && ! grep -Fq 'Description=Managed rotating packet capture on the device LAN' "$CAPTURE_SERVICE"; then
         timestamp="$(date '+%Y%m%d-%H%M%S')"
         cp "$CAPTURE_SERVICE" "${CAPTURE_SERVICE}.backup-${timestamp}"
         chmod 600 "${CAPTURE_SERVICE}.backup-${timestamp}"
-        ok "Backed up existing eth1-capture.service."
+        ok "Backed up the previous eth1-capture.service."
     fi
 
-    temporary_service="${CAPTURE_SERVICE}.$$"
-    {
-        printf '[Unit]\n'
-        printf 'Description=Rotating packet capture on %s\n' "$LAN_IF"
-        printf 'BindsTo=sys-subsystem-net-devices-%s.device\n' "$LAN_IF"
-        printf 'After=sys-subsystem-net-devices-%s.device NetworkManager.service\n' "$LAN_IF"
-        printf 'ConditionPathExists=/sys/class/net/%s\n' "$LAN_IF"
-        printf '\n[Service]\n'
-        printf 'Type=simple\n'
-        printf 'ExecStartPre=%s link set dev %s up\n' "$(command -v ip)" "$LAN_IF"
-        printf 'ExecStart=%s\n' "$CAPTURE_HELPER"
-        printf 'Restart=on-failure\n'
-        printf 'RestartSec=5\n'
-        printf '\n[Install]\n'
-        printf 'WantedBy=multi-user.target\n'
-        printf 'WantedBy=sys-subsystem-net-devices-%s.device\n' "$LAN_IF"
-    } | tee "$temporary_service" >/dev/null
-    chmod 644 "$temporary_service"
-    mv "$temporary_service" "$CAPTURE_SERVICE"
+    nologin_path="$(command -v nologin 2>/dev/null || true)"
+    [[ -n "$nologin_path" ]] || nologin_path="/usr/sbin/nologin"
+
+    if ! id -u "$CAPTURE_SERVICE_USER" >/dev/null 2>&1; then
+        if getent group "$CAPTURE_SERVICE_GROUP" >/dev/null 2>&1; then
+            useradd --system --gid "$CAPTURE_SERVICE_GROUP" --home-dir /nonexistent \
+                --no-create-home --shell "$nologin_path" "$CAPTURE_SERVICE_USER"
+        else
+            useradd --system --user-group --home-dir /nonexistent \
+                --no-create-home --shell "$nologin_path" "$CAPTURE_SERVICE_USER"
+        fi
+        ok "Created the $CAPTURE_SERVICE_USER system account."
+    fi
+
+    if [[ "$(id -gn "$CAPTURE_SERVICE_USER")" != "$CAPTURE_SERVICE_GROUP" ]]; then
+        CAPTURE_STATUS="skipped because the service account has an unexpected primary group"
+        warn "User $CAPTURE_SERVICE_USER must have primary group $CAPTURE_SERVICE_GROUP; capture installation was skipped."
+        return 0
+    fi
+
+    install -d -o root -g root -m 0755 /usr/local/sbin /usr/local/libexec /etc/default
+    install -d -o "$CAPTURE_SERVICE_USER" -g "$CAPTURE_SERVICE_GROUP" -m 0750 "$PCAP_DIRECTORY"
+    find "$PCAP_DIRECTORY" -maxdepth 1 -type f -name 'eth1-*.pcap*' \
+        -exec chown "$CAPTURE_SERVICE_USER:$CAPTURE_SERVICE_GROUP" {} +
+
+    install -o root -g root -m 0755 "$CAPTURE_ASSET_DIRECTORY/zero2w-capture" /usr/local/sbin/zero2w-capture
+    install -o root -g root -m 0644 "$CAPTURE_ASSET_DIRECTORY/zero2w-capture-common" /usr/local/libexec/zero2w-capture-common
+    install -o root -g root -m 0755 "$CAPTURE_ASSET_DIRECTORY/zero2w-capture-prune" /usr/local/libexec/zero2w-capture-prune
+    install -o root -g root -m 0755 "$CAPTURE_ASSET_DIRECTORY/zero2w-capture-check" /usr/local/libexec/zero2w-capture-check
+    install -o root -g root -m 0755 "$CAPTURE_ASSET_DIRECTORY/zero2w-capture-run" /usr/local/libexec/zero2w-capture-run
+    install -o root -g root -m 0644 "$CAPTURE_ASSET_DIRECTORY/eth1-capture.service" "$CAPTURE_SERVICE"
+
+    if [[ ! -f "$CAPTURE_CONFIG_FILE" ]]; then
+        install -o root -g root -m 0644 "$CAPTURE_ASSET_DIRECTORY/zero2w-capture.conf" "$CAPTURE_CONFIG_FILE"
+    else
+        chown root:root "$CAPTURE_CONFIG_FILE"
+        chmod 644 "$CAPTURE_CONFIG_FILE"
+        ok "Preserved existing capture configuration in $CAPTURE_CONFIG_FILE."
+    fi
+
+    if [[ -f "$CAPTURE_HELPER" ]]; then
+        if grep -Fq ' -Z root -w ' "$CAPTURE_HELPER" && \
+            grep -Fq 'eth1-$(date +%Y%m%d-%H%M%S).pcap' "$CAPTURE_HELPER"; then
+            rm -f "$CAPTURE_HELPER"
+            ok "Removed the obsolete eth1-capture-start.sh helper."
+        else
+            warn "Found $CAPTURE_HELPER with unrecognized content; it is no longer used and was left unchanged."
+        fi
+    fi
 
     systemctl daemon-reload
-    if systemctl enable --now eth1-capture.service >/dev/null 2>&1; then
-        CAPTURE_STATUS="enabled"
-        ok "Packet capture service is enabled."
+
+    if ! command -v tcpdump >/dev/null 2>&1 && ! install_tcpdump_if_online; then
+        systemctl disable --now eth1-capture.service >/dev/null 2>&1 || true
+        CAPTURE_STATUS="installed and disabled; tcpdump is unavailable"
+        warn "Capture controls were installed, but tcpdump is unavailable."
+        return 0
+    fi
+
+    if [[ "$CAPTURE_AUTO_START" == "yes" ]]; then
+        if /usr/local/sbin/zero2w-capture enable >/dev/null; then
+            CAPTURE_STATUS="active and enabled at boot"
+            ok "Packet capture service is active and enabled."
+        else
+            systemctl disable --now eth1-capture.service >/dev/null 2>&1 || true
+            CAPTURE_STATUS="installed but automatic activation failed"
+            warn "Packet capture was installed but could not be activated."
+        fi
     else
-        CAPTURE_STATUS="configured but not running"
-        warn "Packet capture service was written, but systemctl could not enable or start it."
+        /usr/local/sbin/zero2w-capture disable >/dev/null 2>&1 || true
+        CAPTURE_STATUS="installed and disabled"
+        ok "Packet capture controls installed; automatic capture remains disabled."
     fi
 }
 
@@ -1077,6 +1140,7 @@ WAN:
 
 Packet capture:
   Status: $CAPTURE_STATUS
+  Control: /usr/local/sbin/zero2w-capture
   Directory: $PCAP_DIRECTORY
 
 Transparent MITM:
